@@ -3,22 +3,41 @@ Energy-Based Pre-training (EBP) training script.
 
 Trains Qwen/Qwen3-0.6B (or any compatible causal LM) with a mixed objective:
 
-    L(θ) = L_FM(θ)  +  γ · L_CE(θ)
+    L(theta) = L_FM(theta)  +  gamma * L_CE(theta)
 
 where:
   * L_FM  is the feature-matching loss, optimised via REINFORCE with RLOO
            baseline using rollouts sampled from the generator.
   * L_CE  is the standard next-token cross-entropy loss (teacher forcing).
 
-The feature network ϕ is an Exponential Moving Average (EMA) of the
-generator: as the generator improves, so do the features used to evaluate
-rollout quality.  EMA weights are updated with stop-gradient after each
-optimiser step.
+Two model variants are available via ``--model_type``:
+
+  * ``ema``    (:class:`~ebp.model.EMAEBPModel`) – uses an Exponential Moving
+    Average of the generator as the feature network.  Requires two forward
+    passes per training step (EMA for features, generator for log-probs).
+
+  * ``online`` (:class:`~ebp.model.OnlineEBPModel`) – uses the live generator
+    as the feature network.  A single forward pass extracts features (detached)
+    and log-probs simultaneously, halving rollout-processing cost.
+
+Both variants use a prefix KV cache during rollout generation so that the
+context is processed only once regardless of ``--num_rollouts``.
 
 Usage
 -----
+    # EMA variant (feature network = EMA of generator):
     python train.py \\
         --model_name Qwen/Qwen3-0.6B \\
+        --model_type ema \\
+        --num_rollouts 4 \\
+        --generation_length 8 \\
+        --gamma 0.1 \\
+        --max_steps 10000
+
+    # Online variant (feature network = live generator, one forward pass):
+    python train.py \\
+        --model_name Qwen/Qwen3-0.6B \\
+        --model_type online \\
         --num_rollouts 4 \\
         --generation_length 8 \\
         --gamma 0.1 \\
@@ -32,13 +51,14 @@ from __future__ import annotations
 import argparse
 import os
 from functools import partial
+from typing import Union
 
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from ebp.data import PretrainingDataset, collate_fn
-from ebp.model import EBPModel
+from ebp.model import EMAEBPModel, OnlineEBPModel
 from ebp.rewards import compute_feature_matching_rewards, compute_rloo_baseline
 
 
@@ -57,6 +77,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="Qwen/Qwen3-0.6B",
         help="HuggingFace model identifier.",
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="ema",
+        choices=["ema", "online"],
+        help=(
+            "Feature-network variant: 'ema' uses an EMA copy of the generator; "
+            "'online' uses the live generator itself (one forward pass per step)."
+        ),
     )
     # Data
     parser.add_argument("--dataset_name", type=str, default="wikitext")
@@ -86,7 +116,7 @@ def parse_args() -> argparse.Namespace:
         "--ema_decay",
         type=float,
         default=0.999,
-        help="EMA decay factor τ (closer to 1 → slower EMA update).",
+        help="EMA decay factor (only used when --model_type ema).",
     )
     parser.add_argument(
         "--gamma",
@@ -130,7 +160,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def training_step(
-    model: EBPModel,
+    model: Union[EMAEBPModel, OnlineEBPModel],
     batch: dict,
     num_rollouts: int,
     generation_length: int,
@@ -140,24 +170,24 @@ def training_step(
 ) -> dict:
     """Execute one EBP training step.
 
-    1. Extract reference features from the EMA model.
-    2. Generate ``num_rollouts`` completions per context.
-    3. Extract rollout features from the EMA model.
-    4. Compute per-rollout feature-matching rewards + RLOO advantages.
-    5. Compute REINFORCE loss and (optionally) cross-entropy loss.
+    1. Extract reference features from the feature network (EMA or live model).
+    2. Generate ``num_rollouts`` completions per context (with prefix KV cache).
+    3. Compute rollout features + log-probs via ``model.compute_rollout_data``
+       (one forward pass for OnlineEBPModel; two for EMAEBPModel).
+    4. Compute REINFORCE loss with RLOO advantages.
+    5. Optionally add the cross-entropy term.
 
     Args:
-        model: :class:`EBPModel` with trainable generator and EMA network.
+        model: Either :class:`EMAEBPModel` or :class:`OnlineEBPModel`.
         batch: Dict of tensors from :func:`ebp.data.collate_fn`.
         num_rollouts: Number of completions to generate per context.
         generation_length: Number of tokens to generate.
-        gamma: Weight of the cross-entropy term (0 → feature-matching only).
+        gamma: Weight of the cross-entropy term (0 -> feature-matching only).
         temperature: Sampling temperature.
         device: Target device.
 
     Returns:
-        Dict with ``loss``, ``reinforce_loss``, and (if ``gamma > 0``)
-        ``ce_loss`` as Python floats for logging.
+        Dict with ``loss``, ``reinforce_loss``, and ``ce_loss``.
     """
     context_ids = batch["context_ids"].to(device)
     context_mask = batch["context_mask"].to(device)
@@ -168,7 +198,7 @@ def training_step(
     context_len = context_ids.shape[1]
 
     # ------------------------------------------------------------------
-    # 1. Reference features  φ(c:y)  from EMA model
+    # 1. Reference features  phi(c:y)
     # ------------------------------------------------------------------
     full_ids = torch.cat([context_ids, completion_ids], dim=1)
     full_mask = torch.cat([context_mask, completion_mask], dim=1)
@@ -178,7 +208,7 @@ def training_step(
     )  # (B, feat_dim)
 
     # ------------------------------------------------------------------
-    # 2. Generate rollouts  ŷ_j ~ p_θ(·|c)
+    # 2. Generate rollouts  y_hat_j ~ p_theta(.|c)
     # ------------------------------------------------------------------
     rollout_ids, rollout_masks = model.generate_rollouts(
         context_ids=context_ids,
@@ -191,36 +221,32 @@ def training_step(
     # rollout_masks: (B * n, context_len + generation_length)
 
     # ------------------------------------------------------------------
-    # 3. Rollout features  φ(c:ŷ_j)  from EMA model
+    # 3. Rollout features + log-probs
+    #    EMAEBPModel:    two forward passes (EMA features + generator log-probs)
+    #    OnlineEBPModel: one forward pass (features detached + log-probs with grad)
     # ------------------------------------------------------------------
-    rollout_features = model.extract_features(
+    rollout_features, rollout_log_probs = model.compute_rollout_data(
         rollout_ids, rollout_masks, completion_start=context_len
-    )  # (B * n, feat_dim)
+    )
+    # rollout_features:  (B * n, feat_dim)  - detached
+    # rollout_log_probs: (B * n,)           - differentiable
 
     # ------------------------------------------------------------------
-    # 4. Compute rewards and REINFORCE loss
+    # 4. Feature-matching rewards and REINFORCE loss
     # ------------------------------------------------------------------
     reinforce_loss = torch.tensor(0.0, device=device)
 
     for i in range(batch_size):
-        # Features for the i-th context's rollouts
-        item_rollout_feat = rollout_features[i * num_rollouts : (i + 1) * num_rollouts]
-        item_ref_feat = ref_features[i]  # (feat_dim,)
+        item_feat = rollout_features[i * num_rollouts : (i + 1) * num_rollouts]
+        item_ref = ref_features[i]  # (feat_dim,)
+        item_lp = rollout_log_probs[i * num_rollouts : (i + 1) * num_rollouts]
 
-        rewards = compute_feature_matching_rewards(item_rollout_feat, item_ref_feat)
+        rewards = compute_feature_matching_rewards(item_feat, item_ref)
         baselines = compute_rloo_baseline(rewards)
         advantages = (rewards - baselines).detach()  # stop-gradient on advantages
 
-        # Log-probabilities under the trainable generator
-        item_rollout_ids = rollout_ids[i * num_rollouts : (i + 1) * num_rollouts]
-        item_rollout_masks = rollout_masks[i * num_rollouts : (i + 1) * num_rollouts]
-
-        log_probs = model.compute_log_probs(
-            item_rollout_ids, item_rollout_masks, completion_start=context_len
-        )  # (n,)
-
-        # REINFORCE: maximise E[advantage * log p]  →  minimise negation
-        reinforce_loss = reinforce_loss - (advantages * log_probs).mean()
+        # REINFORCE: maximise E[advantage * log p]  ->  minimise negation
+        reinforce_loss = reinforce_loss - (advantages * item_lp).mean()
 
     reinforce_loss = reinforce_loss / batch_size
 
@@ -272,17 +298,20 @@ def train(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
-    print(f"Loading model: {args.model_name} ...")
+    print(f"Loading model: {args.model_name} (variant: {args.model_type}) ...")
     from transformers import AutoModelForCausalLM
 
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch_dtype
     ).to(device)
 
-    model = EBPModel(
-        model=base_model,
-        ema_decay=args.ema_decay,
-    )
+    if args.model_type == "ema":
+        model: Union[EMAEBPModel, OnlineEBPModel] = EMAEBPModel(
+            model=base_model,
+            ema_decay=args.ema_decay,
+        )
+    else:
+        model = OnlineEBPModel(model=base_model)
 
     # ------------------------------------------------------------------
     # Dataset
@@ -343,8 +372,9 @@ def train(args: argparse.Namespace) -> None:
             torch.nn.utils.clip_grad_norm_(model.model.parameters(), args.grad_clip)
             optimizer.step()
 
-            # Update EMA feature network (stop-gradient)
-            model.update_ema()
+            # Update EMA feature network (only for EMAEBPModel)
+            if isinstance(model, EMAEBPModel):
+                model.update_ema()
 
             step += 1
 

@@ -17,11 +17,25 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
 
+def load_dataset(*args, **kwargs):
+    """Thin wrapper around ``datasets.load_dataset``.
+
+    Defined at module level so tests can patch ``ebp.data.load_dataset``
+    without importing the heavy ``datasets`` library at import time.
+    """
+    from datasets import load_dataset as _load  # type: ignore[import]
+
+    return _load(*args, **kwargs)
+
+
 class PretrainingDataset(Dataset):
     """Sliding-window text dataset for EBP pretraining.
 
     Loads a HuggingFace ``datasets`` dataset, tokenises all documents, and
     creates fixed-length examples by sliding a window over the token stream.
+    Documents are separated by the tokeniser's EOS token so that no chunk
+    spans two documents, preventing the model from learning spurious
+    cross-document dependencies.
 
     Args:
         tokenizer: HuggingFace tokeniser used for encoding.
@@ -32,7 +46,7 @@ class PretrainingDataset(Dataset):
         completion_length: Number of tokens used as the ground-truth
             completion (and generation target).
         stride: Step size for the sliding window.  Defaults to
-            ``context_length`` (non-overlapping windows).
+            ``context_length + completion_length`` (non-overlapping windows).
         min_doc_chars: Minimum character length required for a document to
             be included.
         text_column: Name of the text column in the dataset.
@@ -50,8 +64,6 @@ class PretrainingDataset(Dataset):
         min_doc_chars: int = 50,
         text_column: str = "text",
     ) -> None:
-        from datasets import load_dataset  # local import to keep top-level fast
-
         self.context_length = context_length
         self.completion_length = completion_length
         chunk_size = context_length + completion_length
@@ -59,13 +71,20 @@ class PretrainingDataset(Dataset):
 
         raw = load_dataset(dataset_name, dataset_config, split=split)
 
-        # Concatenate all document tokens into one long token stream
+        # EOS token used as a document separator so that no chunk spans
+        # two documents.  When eos_token_id is None (rare) we skip separators.
+        eos_id: Optional[int] = tokenizer.eos_token_id
+
+        # Concatenate document tokens separated by EOS, so the model never
+        # predicts tokens from one document given context from another.
         all_tokens: List[int] = []
         for item in raw:
             text = item[text_column]
             if len(text.strip()) < min_doc_chars:
                 continue
             tokens = tokenizer.encode(text, add_special_tokens=False)
+            if all_tokens and eos_id is not None:
+                all_tokens.append(eos_id)
             all_tokens.extend(tokens)
 
         # Create fixed-length chunks via sliding window
@@ -101,10 +120,10 @@ def collate_fn(
 
     Returns:
         Dict with keys:
-            * ``context_ids``    – ``(B, max_ctx_len)``
-            * ``context_mask``   – ``(B, max_ctx_len)``
-            * ``completion_ids`` – ``(B, max_comp_len)``
-            * ``completion_mask``– ``(B, max_comp_len)``
+            * ``context_ids``    - ``(B, max_ctx_len)``
+            * ``context_mask``   - ``(B, max_ctx_len)``
+            * ``completion_ids`` - ``(B, max_comp_len)``
+            * ``completion_mask``- ``(B, max_comp_len)``
     """
     max_ctx = max(len(b["context_ids"]) for b in batch)
     max_comp = max(len(b["completion_ids"]) for b in batch)
