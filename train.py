@@ -23,6 +23,29 @@ Two model variants are available via ``--model_type``:
 Both variants use a prefix KV cache during rollout generation so that the
 context is processed only once regardless of ``--num_rollouts``.
 
+Metrics
+-------
+Every step the following scalars are logged to stdout and accumulated in a
+list of dicts that is pickled to ``<output_dir>/metrics.pkl`` (override with
+``--metrics_file``)::
+
+    step          – global training step
+    loss          – total loss (reinforce + gamma * ce)
+    reinforce_loss – REINFORCE policy-gradient term
+    ce_loss       – cross-entropy term (0 when --gamma 0)
+    mean_reward   – mean feature-matching reward across all rollouts
+    entropy       – mean per-token negative log-prob of rollout sequences
+                    (proxy for policy entropy; higher = more exploratory)
+
+To plot the metrics after training::
+
+    import pickle, matplotlib.pyplot as plt
+    history = pickle.load(open("output/metrics.pkl", "rb"))
+    steps   = [m["step"] for m in history]
+    plt.plot(steps, [m["mean_reward"] for m in history], label="reward")
+    plt.plot(steps, [m["entropy"]     for m in history], label="entropy")
+    plt.legend(); plt.show()
+
 Usage
 -----
     # EMA variant (feature network = EMA of generator):
@@ -50,8 +73,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import pickle
 from functools import partial
-from typing import Union
+from typing import List, Union
 
 import torch
 from torch.utils.data import DataLoader
@@ -142,6 +166,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_steps", type=int, default=100)
     parser.add_argument("--save_steps", type=int, default=1_000)
     parser.add_argument("--output_dir", type=str, default="./output")
+    parser.add_argument(
+        "--metrics_file",
+        type=str,
+        default=None,
+        help=(
+            "Path to save the metrics history as a pickle file. "
+            "Defaults to <output_dir>/metrics.pkl."
+        ),
+    )
     # Misc
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -187,7 +220,9 @@ def training_step(
         device: Target device.
 
     Returns:
-        Dict with ``loss``, ``reinforce_loss``, and ``ce_loss``.
+        Dict with keys ``loss``, ``reinforce_loss``, ``ce_loss``,
+        ``mean_reward``, and ``entropy`` (mean per-token negative log-prob of
+        rollout sequences, a proxy for the policy entropy).
     """
     context_ids = batch["context_ids"].to(device)
     context_mask = batch["context_mask"].to(device)
@@ -235,6 +270,7 @@ def training_step(
     # 4. Feature-matching rewards and REINFORCE loss
     # ------------------------------------------------------------------
     reinforce_loss = torch.tensor(0.0, device=device)
+    all_rewards: List[torch.Tensor] = []
 
     for i in range(batch_size):
         item_feat = rollout_features[i * num_rollouts : (i + 1) * num_rollouts]
@@ -242,6 +278,7 @@ def training_step(
         item_lp = rollout_log_probs[i * num_rollouts : (i + 1) * num_rollouts]
 
         rewards = compute_feature_matching_rewards(item_feat, item_ref)
+        all_rewards.append(rewards.detach())
         baselines = compute_rloo_baseline(rewards)
         advantages = (rewards - baselines).detach()  # stop-gradient on advantages
 
@@ -249,6 +286,14 @@ def training_step(
         reinforce_loss = reinforce_loss - (advantages * item_lp).mean()
 
     reinforce_loss = reinforce_loss / batch_size
+
+    # Mean reward across all rollouts (diagnostic)
+    mean_reward = torch.cat(all_rewards).mean().item()
+
+    # Per-token NLL of rollout sequences (proxy for policy entropy).
+    # NLL = -mean(log p) / gen_len.  By Jensen's inequality, H(p) ≥ NLL,
+    # so this is a lower bound on entropy: higher = more exploratory policy.
+    policy_nll = (-rollout_log_probs.detach().mean() / max(generation_length, 1)).item()
 
     # ------------------------------------------------------------------
     # 5. Optional cross-entropy term
@@ -266,6 +311,9 @@ def training_step(
         "loss": total_loss,
         "reinforce_loss": reinforce_loss.item(),
         "ce_loss": ce_loss_val,
+        "mean_reward": mean_reward,
+        # Logged as "entropy"; computed as per-token NLL (lower bound on H(p))
+        "entropy": policy_nll,
     }
 
 
@@ -348,9 +396,11 @@ def train(args: argparse.Namespace) -> None:
     # Training loop
     # ------------------------------------------------------------------
     os.makedirs(args.output_dir, exist_ok=True)
+    metrics_file = args.metrics_file or os.path.join(args.output_dir, "metrics.pkl")
 
     step = 0
     model.train()
+    metrics_history: List[dict] = []
 
     while step < args.max_steps:
         for batch in dataloader:
@@ -378,11 +428,29 @@ def train(args: argparse.Namespace) -> None:
 
             step += 1
 
+            # Convert the loss tensor to a plain float now that backward() has
+            # been called; all other result values are already Python floats.
+            loss_val = result["loss"].item()
+
+            # Record metrics for every step (floats only, very lightweight)
+            metrics_history.append(
+                {
+                    "step": step,
+                    "loss": loss_val,
+                    "reinforce_loss": result["reinforce_loss"],
+                    "ce_loss": result["ce_loss"],
+                    "mean_reward": result["mean_reward"],
+                    "entropy": result["entropy"],
+                }
+            )
+
             if step % args.log_steps == 0:
                 print(
-                    f"Step {step:6d} | loss={result['loss'].item():.4f} "
+                    f"Step {step:6d} | loss={loss_val:.4f} "
                     f"reinforce={result['reinforce_loss']:.4f} "
-                    f"ce={result['ce_loss']:.4f}"
+                    f"ce={result['ce_loss']:.4f} "
+                    f"reward={result['mean_reward']:.4f} "
+                    f"entropy={result['entropy']:.4f}"
                 )
 
             if step % args.save_steps == 0:
@@ -390,6 +458,10 @@ def train(args: argparse.Namespace) -> None:
                 model.model.save_pretrained(save_path)
                 tokenizer.save_pretrained(save_path)
                 print(f"Saved checkpoint to {save_path}")
+                # Also persist metrics so far
+                with open(metrics_file, "wb") as fh:
+                    pickle.dump(metrics_history, fh)
+                print(f"Metrics saved to {metrics_file}")
 
     # ------------------------------------------------------------------
     # Final save
@@ -398,6 +470,10 @@ def train(args: argparse.Namespace) -> None:
     model.model.save_pretrained(final_path)
     tokenizer.save_pretrained(final_path)
     print(f"Training complete. Final model saved to {final_path}")
+
+    with open(metrics_file, "wb") as fh:
+        pickle.dump(metrics_history, fh)
+    print(f"Metrics history saved to {metrics_file}")
 
 
 if __name__ == "__main__":
