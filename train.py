@@ -105,11 +105,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_type",
         type=str,
-        default="ema",
+        default="online",
         choices=["ema", "online"],
         help=(
             "Feature-network variant: 'ema' uses an EMA copy of the generator; "
-            "'online' uses the live generator itself (one forward pass per step)."
+            "'online' uses the live generator itself (one forward pass per step, "
+            "lower VRAM, usually higher throughput)."
         ),
     )
     # Data
@@ -180,9 +181,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dtype",
         type=str,
-        default="float32",
-        choices=["float32", "bfloat16", "float16"],
-        help="Model parameter dtype.",
+        default="auto",
+        choices=["auto", "float32", "bfloat16", "float16"],
+        help=(
+            "Model parameter dtype. 'auto' picks bf16 on supported CUDA GPUs, "
+            "else fp16 on CUDA, else fp32 on CPU."
+        ),
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help=(
+            "Enable gradient checkpointing on the trainable generator to reduce "
+            "activation memory (slight speed tradeoff)."
+        ),
     )
     return parser.parse_args()
 
@@ -328,12 +340,21 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    dtype_map = {
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-    }
-    torch_dtype = dtype_map[args.dtype]
+    if args.dtype == "auto":
+        if device.type == "cuda":
+            torch_dtype = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
+        else:
+            torch_dtype = torch.float32
+    else:
+        dtype_map = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }
+        torch_dtype = dtype_map[args.dtype]
+    print(f"Using dtype: {torch_dtype}")
 
     # ------------------------------------------------------------------
     # Tokeniser
@@ -360,6 +381,10 @@ def train(args: argparse.Namespace) -> None:
         )
     else:
         model = OnlineEBPModel(model=base_model)
+
+    if args.gradient_checkpointing:
+        model.model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled on generator model")
 
     # ------------------------------------------------------------------
     # Dataset
@@ -417,7 +442,7 @@ def train(args: argparse.Namespace) -> None:
                 device=device,
             )
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             result["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.model.parameters(), args.grad_clip)
             optimizer.step()
