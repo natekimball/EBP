@@ -254,12 +254,14 @@ class EMAEBPModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        use_cache: bool = False,
     ):
         """Standard HuggingFace forward through the trainable generator."""
         return self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
+            use_cache=use_cache,
         )
 
     # ------------------------------------------------------------------
@@ -301,7 +303,11 @@ class EMAEBPModel(nn.Module):
             hooks.append(self._ema_layers[idx].register_forward_hook(make_hook(idx)))
 
         try:
-            self.ema_model(input_ids=input_ids, attention_mask=attention_mask)
+            self.ema_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
         finally:
             for hook in hooks:
                 hook.remove()
@@ -335,7 +341,11 @@ class EMAEBPModel(nn.Module):
             ``(B,)`` sum of per-token log-probabilities for the completion
             (with gradients).
         """
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
         return _sum_completion_log_probs(
             outputs.logits, input_ids, attention_mask, completion_start
         )
@@ -490,12 +500,14 @@ class OnlineEBPModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        use_cache: bool = False,
     ):
         """Standard HuggingFace forward through the trainable generator."""
         return self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
+            use_cache=use_cache,
         )
 
     # ------------------------------------------------------------------
@@ -537,7 +549,11 @@ class OnlineEBPModel(nn.Module):
             hooks.append(self._model_layers[idx].register_forward_hook(make_hook(idx)))
 
         try:
-            self.model(input_ids=input_ids, attention_mask=attention_mask)
+            self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
         finally:
             for hook in hooks:
                 hook.remove()
@@ -595,7 +611,11 @@ class OnlineEBPModel(nn.Module):
             hooks.append(self._model_layers[idx].register_forward_hook(make_hook(idx)))
 
         try:
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
         finally:
             for hook in hooks:
                 hook.remove()
@@ -759,6 +779,7 @@ def _generate_with_kv_cache(
             max_new_tokens=generation_length,
             do_sample=True,
             temperature=temperature,
+            use_cache=True,
             pad_token_id=model.config.eos_token_id,
             **generate_kwargs,
         )
@@ -781,6 +802,7 @@ def _generate_with_kv_cache(
             max_new_tokens=generation_length,
             do_sample=True,
             temperature=temperature,
+            use_cache=True,
             pad_token_id=model.config.eos_token_id,
             **generate_kwargs,
         )
