@@ -83,7 +83,7 @@ from transformers import AutoTokenizer
 
 from ebp.data import PretrainingDataset, collate_fn
 from ebp.model import EMAEBPModel, OnlineEBPModel
-from ebp.rewards import compute_feature_matching_rewards, compute_rloo_baseline
+from ebp.rewards import compute_feature_matching_terms, compute_rloo_baseline
 
 
 # ---------------------------------------------------------------------------
@@ -283,14 +283,19 @@ def training_step(
     # ------------------------------------------------------------------
     reinforce_loss = torch.tensor(0.0, device=device)
     all_rewards: List[torch.Tensor] = []
+    all_alignment: List[torch.Tensor] = []
+    all_diversity: List[torch.Tensor] = []
 
     for i in range(batch_size):
         item_feat = rollout_features[i * num_rollouts : (i + 1) * num_rollouts]
         item_ref = ref_features[i]  # (feat_dim,)
         item_lp = rollout_log_probs[i * num_rollouts : (i + 1) * num_rollouts]
 
-        rewards = compute_feature_matching_rewards(item_feat, item_ref)
+        alignment, diversity = compute_feature_matching_terms(item_feat, item_ref)
+        rewards = alignment - diversity
         all_rewards.append(rewards.detach())
+        all_alignment.append(alignment.detach())
+        all_diversity.append(diversity.detach())
         baselines = compute_rloo_baseline(rewards)
         advantages = (rewards - baselines).detach()  # stop-gradient on advantages
 
@@ -301,6 +306,8 @@ def training_step(
 
     # Mean reward across all rollouts (diagnostic)
     mean_reward = torch.cat(all_rewards).mean().item()
+    mean_alignment = torch.cat(all_alignment).mean().item()
+    mean_diversity = torch.cat(all_diversity).mean().item()
 
     # Per-token NLL of rollout sequences (proxy for policy entropy).
     # NLL = -mean(log p) / gen_len.  By Jensen's inequality, H(p) ≥ NLL,
@@ -324,6 +331,8 @@ def training_step(
         "reinforce_loss": reinforce_loss.item(),
         "ce_loss": ce_loss_val,
         "mean_reward": mean_reward,
+        "mean_alignment": mean_alignment,
+        "mean_diversity": mean_diversity,
         # Logged as "entropy"; computed as per-token NLL (lower bound on H(p))
         "entropy": policy_nll,
     }
@@ -465,6 +474,8 @@ def train(args: argparse.Namespace) -> None:
                     "reinforce_loss": result["reinforce_loss"],
                     "ce_loss": result["ce_loss"],
                     "mean_reward": result["mean_reward"],
+                    "mean_alignment": result["mean_alignment"],
+                    "mean_diversity": result["mean_diversity"],
                     "entropy": result["entropy"],
                 }
             )
@@ -475,6 +486,8 @@ def train(args: argparse.Namespace) -> None:
                     f"reinforce={result['reinforce_loss']:.4f} "
                     f"ce={result['ce_loss']:.4f} "
                     f"reward={result['mean_reward']:.4f} "
+                    f"align={result['mean_alignment']:.4f} "
+                    f"div={result['mean_diversity']:.4f} "
                     f"entropy={result['entropy']:.4f}"
                 )
 

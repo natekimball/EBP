@@ -15,6 +15,48 @@ from __future__ import annotations
 import torch
 
 
+def compute_feature_matching_terms(
+    rollout_features: torch.Tensor,
+    ref_feature: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute alignment and diversity terms used in Eq. 7 (EBFT).
+
+    Args:
+        rollout_features: ``(n, D)`` feature vectors of the ``n`` sampled
+            completions.
+        ref_feature: ``(D,)`` feature vector of the ground-truth completion.
+
+    Returns:
+        alignment: ``(n,)`` term ``2 * phi_j · phi_y``.
+        diversity: ``(n,)`` term ``2/(n-1) * sum_{j'!=j} phi_j · phi_j'``.
+    """
+    if rollout_features.dim() != 2:
+        raise ValueError(
+            f"rollout_features must be 2-D (n, D), got shape {rollout_features.shape}"
+        )
+    if ref_feature.dim() != 1:
+        raise ValueError(
+            f"ref_feature must be 1-D (D,), got shape {ref_feature.shape}"
+        )
+
+    n = rollout_features.shape[0]
+
+    # Alignment term: 2 phi_j · phi_y  ->  (n,)
+    alignment = 2.0 * torch.mv(rollout_features, ref_feature)
+
+    # Diversity term: 2/(n-1) * sum_{j'!=j} phi_j · phi_j'
+    if n > 1:
+        pairwise = rollout_features @ rollout_features.T  # (n, n)
+        sum_others = pairwise.sum(dim=1) - pairwise.diagonal()  # (n,)
+        diversity = (2.0 / (n - 1)) * sum_others
+    else:
+        diversity = torch.zeros(
+            n, device=rollout_features.device, dtype=rollout_features.dtype
+        )
+
+    return alignment, diversity
+
+
 def compute_feature_matching_rewards(
     rollout_features: torch.Tensor,
     ref_feature: torch.Tensor,
@@ -29,28 +71,10 @@ def compute_feature_matching_rewards(
     Returns:
         rewards: ``(n,)`` scalar reward for each rollout.
     """
-    if rollout_features.dim() != 2:
-        raise ValueError(
-            f"rollout_features must be 2-D (n, D), got shape {rollout_features.shape}"
-        )
-    if ref_feature.dim() != 1:
-        raise ValueError(
-            f"ref_feature must be 1-D (D,), got shape {ref_feature.shape}"
-        )
-
-    n = rollout_features.shape[0]
-
-    # Alignment term: 2 φ_j · φ_y  →  (n,)
-    alignment = 2.0 * torch.mv(rollout_features, ref_feature)
-
-    # Diversity term: 2/(n-1) Σ_{j'≠j} φ_j · φ_{j'}
-    if n > 1:
-        pairwise = rollout_features @ rollout_features.T  # (n, n)
-        # Sum of off-diagonal entries for each row
-        sum_others = pairwise.sum(dim=1) - pairwise.diagonal()  # (n,)
-        diversity = (2.0 / (n - 1)) * sum_others
-    else:
-        diversity = torch.zeros(n, device=rollout_features.device, dtype=rollout_features.dtype)
+    alignment, diversity = compute_feature_matching_terms(
+        rollout_features=rollout_features,
+        ref_feature=ref_feature,
+    )
 
     return alignment - diversity  # (n,)
 
