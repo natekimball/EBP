@@ -342,6 +342,7 @@ def training_step(
     temperature: float,
     device: torch.device,
     log_cuda_memory: bool = False,
+    early_ce_backward: bool = False,
 ) -> dict:
     """Execute one EBP training step.
 
@@ -393,6 +394,7 @@ def training_step(
     full_mask = torch.cat([context_mask, completion_mask], dim=1)
 
     ce_loss: torch.Tensor | None = None
+    ce_loss_val = 0.0
     used_combined_ref_ce = False
 
     # In online mode with gamma > 0, compute CE and reference features
@@ -407,6 +409,12 @@ def training_step(
         )
         _record_cuda_peak("ref")
         used_combined_ref_ce = True
+        ce_loss_val = ce_loss.item()
+
+        if early_ce_backward:
+            _reset_cuda_peak("ce_bwd_early")
+            (gamma * ce_loss).backward()
+            _record_cuda_peak("ce_bwd_early")
     else:
         model.eval()
         _reset_cuda_peak("ref")
@@ -414,6 +422,18 @@ def training_step(
             full_ids, full_mask, completion_start=context_len
         )  # (B, feat_dim)
         _record_cuda_peak("ref")
+
+        if early_ce_backward and gamma > 0.0:
+            model.train()
+            _reset_cuda_peak("ce_fwd")
+            ce_out = model(input_ids=full_ids, attention_mask=full_mask, labels=full_ids)
+            ce_loss = ce_out.loss
+            ce_loss_val = ce_loss.item()
+            _record_cuda_peak("ce_fwd")
+
+            _reset_cuda_peak("ce_bwd_early")
+            (gamma * ce_loss).backward()
+            _record_cuda_peak("ce_bwd_early")
 
     # ------------------------------------------------------------------
     # 2. Generate rollouts  y_hat_j ~ p_theta(.|c)
@@ -472,21 +492,30 @@ def training_step(
     # 5. Optional cross-entropy term
     # ------------------------------------------------------------------
     total_loss = reinforce_loss
-    ce_loss_val = 0.0
 
     if gamma > 0.0:
-        if ce_loss is None:
+        if ce_loss is None and not early_ce_backward:
             _reset_cuda_peak("ce_fwd")
             ce_out = model(input_ids=full_ids, attention_mask=full_mask, labels=full_ids)
             ce_loss = ce_out.loss
             _record_cuda_peak("ce_fwd")
+            ce_loss_val = ce_loss.item()
         elif used_combined_ref_ce and log_cuda_memory and device.type == "cuda":
             # Combined pass already measured in the "ref" stage.
             cuda_mem["ce_fwd_alloc_mb"] = cuda_mem.get("ref_alloc_mb", 0.0)
             cuda_mem["ce_fwd_reserved_mb"] = cuda_mem.get("ref_reserved_mb", 0.0)
 
-        total_loss = total_loss + gamma * ce_loss
-        ce_loss_val = ce_loss.item()
+        if early_ce_backward:
+            # CE term was already backpropagated to reduce peak VRAM.
+            total_loss = reinforce_loss + reinforce_loss.new_tensor(gamma * ce_loss_val)
+        else:
+            total_loss = total_loss + gamma * ce_loss
+
+    # Backward schedule lives in this function for a simpler outer loop.
+    backward_target = reinforce_loss if early_ce_backward else total_loss
+    _reset_cuda_peak("backward")
+    backward_target.backward()
+    _record_cuda_peak("backward")
 
     result = {
         "loss": total_loss,
@@ -684,10 +713,18 @@ def train(args: argparse.Namespace) -> None:
     model.train()
     metrics_history: List[dict] = []
 
+    # Memory-constrained fallback: backpropagate CE early to release its graph
+    # before rollout tensors/activations are created. Alternative (often faster
+    # when memory headroom exists): keep CE and REINFORCE in one combined loss
+    # and call backward once.
+    use_memory_constrained_backward = True
+
     while step < args.max_steps:
         for batch in dataloader:
             if step >= args.max_steps:
                 break
+
+            optimizer.zero_grad(set_to_none=True)
 
             result = training_step(
                 model=model,
@@ -698,19 +735,8 @@ def train(args: argparse.Namespace) -> None:
                 temperature=args.temperature,
                 device=device,
                 log_cuda_memory=args.log_cuda_memory,
+                early_ce_backward=use_memory_constrained_backward,
             )
-
-            optimizer.zero_grad(set_to_none=True)
-            if args.log_cuda_memory and device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats(device)
-            result["loss"].backward()
-            if args.log_cuda_memory and device.type == "cuda":
-                result.setdefault("cuda_mem", {})["backward_alloc_mb"] = (
-                    torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-                )
-                result.setdefault("cuda_mem", {})["backward_reserved_mb"] = (
-                    torch.cuda.max_memory_reserved(device) / (1024 ** 2)
-                )
             torch.nn.utils.clip_grad_norm_(model.model.parameters(), args.grad_clip)
             if args.log_cuda_memory and device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)

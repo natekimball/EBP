@@ -610,6 +610,44 @@ class OnlineEBPModel(nn.Module):
 
         return features, log_probs
 
+    def forward_ce_and_ref_features(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        completion_start: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Single forward pass returning CE loss and detached reference features.
+
+        Used by the memory-constrained training schedule to compute the CE
+        term and online reference features together in one full-sequence pass.
+
+        Args:
+            input_ids: ``(B, L)`` full sequence (context + completion).
+            attention_mask: ``(B, L)`` binary mask.
+            completion_start: Index of the first completion token.
+
+        Returns:
+            ce_loss: Scalar CE loss tensor with gradients.
+            ref_features: ``(B, D * K)`` detached reference features.
+        """
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=input_ids,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        ref_features = _features_from_hidden_states(
+            hidden_states=outputs.hidden_states,
+            feature_layer_indices=self.feature_layer_indices,
+            attention_mask=attention_mask,
+            completion_start=completion_start,
+            detach=True,
+        )
+        return outputs.loss, ref_features
+
     # ------------------------------------------------------------------
     # Combined rollout data (features + log probs in one forward pass)
     # ------------------------------------------------------------------
