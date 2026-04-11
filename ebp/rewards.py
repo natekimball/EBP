@@ -8,6 +8,10 @@ Implements the per-rollout reward from Equation (7) of the EBFT paper:
 
 and the REINFORCE Leave-One-Out (RLOO) baseline used to reduce variance in
 the policy-gradient update.
+
+Batched/vectorized variants (``*_batched``) operate over an entire batch of
+``B`` contexts each with ``n`` rollouts in a single tensor operation, avoiding
+a Python-level loop over batch items.
 """
 
 from __future__ import annotations
@@ -102,3 +106,145 @@ def compute_rloo_baseline(rewards: torch.Tensor) -> torch.Tensor:
     total = rewards.sum()
     baselines = (total - rewards) / (n - 1)
     return baselines
+
+
+# ---------------------------------------------------------------------------
+# Batched / vectorized variants  (operate over full batch without Python loop)
+# ---------------------------------------------------------------------------
+
+
+def compute_feature_matching_terms_batched(
+    rollout_features: torch.Tensor,
+    ref_features: torch.Tensor,
+    num_rollouts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched alignment and diversity terms for a full batch of contexts.
+
+    Processes all ``B`` contexts and their ``n = num_rollouts`` rollouts in a
+    single vectorized operation, avoiding a Python-level loop over batch items.
+
+    The layout of ``rollout_features`` follows the convention used by
+    :meth:`~ebp.model.EMAEBPModel.compute_rollout_data`: rollouts for context
+    ``i`` occupy rows ``[i * n : (i + 1) * n]``.
+
+    Args:
+        rollout_features: ``(B * n, D)`` feature vectors for all rollouts.
+        ref_features: ``(B, D)`` feature vector for each ground-truth
+            completion.
+        num_rollouts: Number of rollouts per context (``n``).
+
+    Returns:
+        alignment: ``(B * n,)`` term ``2 * phi_j · phi_y``.
+        diversity: ``(B * n,)`` term ``2/(n-1) * sum_{j'!=j} phi_j · phi_j'``.
+    """
+    if rollout_features.dim() != 2:
+        raise ValueError(
+            f"rollout_features must be 2-D (B*n, D), got shape {rollout_features.shape}"
+        )
+    if ref_features.dim() != 2:
+        raise ValueError(
+            f"ref_features must be 2-D (B, D), got shape {ref_features.shape}"
+        )
+
+    n = num_rollouts
+    total = rollout_features.shape[0]
+    if total % n != 0:
+        raise ValueError(
+            f"rollout_features first dimension ({total}) must be divisible by "
+            f"num_rollouts ({n})"
+        )
+    batch_size = total // n
+    D = rollout_features.shape[1]
+
+    if ref_features.shape[0] != batch_size:
+        raise ValueError(
+            f"ref_features batch dimension ({ref_features.shape[0]}) must equal "
+            f"rollout_features first dimension / num_rollouts ({batch_size})"
+        )
+
+    # Reshape to (B, n, D) for batched operations
+    rf = rollout_features.reshape(batch_size, n, D)  # (B, n, D)
+
+    # Alignment: 2 * phi_j . phi_y  ->  (B, n)
+    # ref_features: (B, D) -> (B, 1, D) for broadcasting
+    alignment = 2.0 * (rf * ref_features.unsqueeze(1)).sum(dim=-1)  # (B, n)
+
+    # Diversity: 2/(n-1) * sum_{j'!=j} phi_j . phi_j'  ->  (B, n)
+    if n > 1:
+        # Batched pairwise dot products: (B, n, n)
+        pairwise = torch.bmm(rf, rf.transpose(1, 2))  # (B, n, n)
+        # Sum over all j' and subtract the j==j' term
+        sum_others = pairwise.sum(dim=2) - pairwise.diagonal(dim1=1, dim2=2)  # (B, n)
+        diversity = (2.0 / (n - 1)) * sum_others  # (B, n)
+    else:
+        diversity = torch.zeros(
+            batch_size, n, device=rollout_features.device, dtype=rollout_features.dtype
+        )
+
+    return alignment.reshape(total), diversity.reshape(total)
+
+
+def compute_feature_matching_rewards_batched(
+    rollout_features: torch.Tensor,
+    ref_features: torch.Tensor,
+    num_rollouts: int,
+) -> torch.Tensor:
+    """Batched feature-matching rewards for a full batch of contexts (Eq. 7).
+
+    Vectorized counterpart of :func:`compute_feature_matching_rewards` that
+    handles all ``B`` contexts at once.
+
+    Args:
+        rollout_features: ``(B * n, D)`` feature vectors for all rollouts.
+        ref_features: ``(B, D)`` ground-truth feature vectors.
+        num_rollouts: Number of rollouts per context (``n``).
+
+    Returns:
+        rewards: ``(B * n,)`` scalar reward for each rollout.
+    """
+    alignment, diversity = compute_feature_matching_terms_batched(
+        rollout_features=rollout_features,
+        ref_features=ref_features,
+        num_rollouts=num_rollouts,
+    )
+    return alignment - diversity  # (B * n,)
+
+
+def compute_rloo_baseline_batched(
+    rewards: torch.Tensor,
+    num_rollouts: int,
+) -> torch.Tensor:
+    """Batched REINFORCE Leave-One-Out (RLOO) baseline.
+
+    Vectorized counterpart of :func:`compute_rloo_baseline` that operates over
+    all ``B`` contexts simultaneously.
+
+    For rollout ``j`` of context ``i`` the baseline is:
+
+        b_{i,j} = (Σ_{j'} r_{i,j'} − r_{i,j}) / (n − 1)
+
+    For a single rollout per context (``n == 1``) zero baselines are returned.
+
+    Args:
+        rewards: ``(B * n,)`` reward for each rollout, ordered so that rollouts
+            for context ``i`` occupy positions ``[i * n : (i + 1) * n]``.
+        num_rollouts: Number of rollouts per context (``n``).
+
+    Returns:
+        baselines: ``(B * n,)`` RLOO baseline for each rollout.
+    """
+    n = num_rollouts
+    total = rewards.shape[0]
+    if total % n != 0:
+        raise ValueError(
+            f"rewards length ({total}) must be divisible by num_rollouts ({n})"
+        )
+
+    if n <= 1:
+        return torch.zeros_like(rewards)
+
+    batch_size = total // n
+    r = rewards.reshape(batch_size, n)  # (B, n)
+    total_per_ctx = r.sum(dim=1, keepdim=True)  # (B, 1)
+    baselines = (total_per_ctx - r) / (n - 1)  # (B, n)
+    return baselines.reshape(total)  # (B * n,)
