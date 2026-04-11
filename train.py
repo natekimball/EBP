@@ -190,7 +190,7 @@ def parse_args() -> argparse.Namespace:
         "--grad_clip", type=float, default=1.0, help="Max gradient norm."
     )
     # Training schedule
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_steps", type=int, default=10_000)
     parser.add_argument("--log_steps", type=int, default=100)
     parser.add_argument("--save_steps", type=int, default=1_000)
@@ -233,7 +233,90 @@ def parse_args() -> argparse.Namespace:
             "transfer. Defaults to enabled on CUDA and disabled on CPU."
         ),
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help=(
+            "DataLoader worker count. Defaults to 0 on CPU, and to a small "
+            "CPU-dependent value on CUDA for better pinned-memory reuse."
+        ),
+    )
+    parser.add_argument(
+        "--persistent_workers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Keep DataLoader workers alive between iterations. Defaults to "
+            "enabled when num_workers > 0 to re-use pinned buffers."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=2,
+        help="Number of prefetched batches per worker when num_workers > 0.",
+    )
+    parser.add_argument(
+        "--use_fused_adamw",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use CUDA fused AdamW kernels when available (falls back "
+            "automatically if unsupported)."
+        ),
+    )
+    parser.add_argument(
+        "--use_flash_attention",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Request FlashAttention v2 when loading supported models on CUDA "
+            "(falls back automatically if unavailable)."
+        ),
+    )
+    parser.add_argument(
+        "--compile_model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compile the generator with torch.compile when available.",
+    )
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="Compilation mode used by torch.compile.",
+    )
+    parser.add_argument(
+        "--compile_fullgraph",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pass fullgraph=True to torch.compile.",
+    )
     return parser.parse_args()
+
+
+def _configure_tensor_cores(device: torch.device) -> None:
+    """Enable Tensor Core-friendly settings on Ampere+ CUDA GPUs."""
+    if device.type != "cuda":
+        return
+
+    major, minor = torch.cuda.get_device_capability(device)
+    ampere_or_newer = major >= 8
+    if ampere_or_newer:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        print(
+            "Enabled Tensor Core acceleration (TF32 matmul/cudnn) "
+            f"for compute capability {major}.{minor}"
+        )
+    else:
+        print(
+            "Tensor Core TF32 acceleration not enabled "
+            f"(compute capability {major}.{minor} is pre-Ampere)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +471,7 @@ def train(args: argparse.Namespace) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    _configure_tensor_cores(device)
 
     if args.dtype == "auto":
         if device.type == "cuda":
@@ -419,9 +503,27 @@ def train(args: argparse.Namespace) -> None:
     print(f"Loading model: {args.model_name} (variant: {args.model_type}) ...")
     from transformers import AutoModelForCausalLM
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch_dtype
-    ).to(device)
+    model_load_kwargs = {"torch_dtype": torch_dtype}
+    if device.type == "cuda" and args.use_flash_attention:
+        model_load_kwargs["attn_implementation"] = "flash_attention_2"
+        print("Requesting FlashAttention v2 kernels for model attention")
+
+    try:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.model_name, **model_load_kwargs
+        ).to(device)
+    except Exception as exc:
+        if model_load_kwargs.get("attn_implementation") == "flash_attention_2":
+            print(
+                "FlashAttention request failed; falling back to model default "
+                f"attention implementation. Reason: {exc}"
+            )
+            model_load_kwargs.pop("attn_implementation", None)
+            base_model = AutoModelForCausalLM.from_pretrained(
+                args.model_name, **model_load_kwargs
+            ).to(device)
+        else:
+            raise
 
     if args.model_type == "ema":
         model: Union[EMAEBPModel, OnlineEBPModel] = EMAEBPModel(
@@ -434,6 +536,20 @@ def train(args: argparse.Namespace) -> None:
     if args.gradient_checkpointing:
         model.model.gradient_checkpointing_enable()
         print("Gradient checkpointing enabled on generator model")
+
+    if args.compile_model and hasattr(torch, "compile"):
+        try:
+            model.model = torch.compile(
+                model.model,
+                mode=args.compile_mode,
+                fullgraph=args.compile_fullgraph,
+            )
+            print(
+                "Enabled torch.compile for generator "
+                f"(mode={args.compile_mode}, fullgraph={args.compile_fullgraph})"
+            )
+        except Exception as exc:
+            print(f"torch.compile unavailable for this setup; continuing without it: {exc}")
 
     # ------------------------------------------------------------------
     # Dataset
@@ -454,25 +570,67 @@ def train(args: argparse.Namespace) -> None:
     print(f"Dataset size: {len(dataset)} examples")
 
     pin_memory = args.pin_memory if args.pin_memory is not None else device.type == "cuda"
-    print(f"DataLoader pin_memory: {pin_memory}")
+    if args.num_workers is None:
+        if device.type == "cuda":
+            cpu_count = os.cpu_count() or 1
+            num_workers = max(1, min(8, cpu_count // 2))
+        else:
+            num_workers = 0
+    else:
+        num_workers = max(0, args.num_workers)
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=partial(collate_fn, pad_token_id=pad_id),
-        drop_last=True,
-        pin_memory=pin_memory,
+    persistent_workers = (
+        args.persistent_workers
+        if args.persistent_workers is not None
+        else num_workers > 0
     )
+
+    dataloader_kwargs = {
+        "dataset": dataset,
+        "batch_size": args.batch_size,
+        "shuffle": True,
+        "collate_fn": partial(collate_fn, pad_token_id=pad_id),
+        "drop_last": True,
+        "pin_memory": pin_memory,
+        "num_workers": num_workers,
+    }
+    if num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = persistent_workers
+        dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+
+    print(
+        "DataLoader settings: "
+        f"pin_memory={pin_memory}, num_workers={num_workers}, "
+        f"persistent_workers={persistent_workers if num_workers > 0 else False}, "
+        f"prefetch_factor={args.prefetch_factor if num_workers > 0 else 'n/a'}"
+    )
+
+    dataloader = DataLoader(**dataloader_kwargs)
 
     # ------------------------------------------------------------------
     # Optimiser (only the trainable generator parameters)
     # ------------------------------------------------------------------
-    optimizer = torch.optim.AdamW(
-        model.model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    optimizer_kwargs = {
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+    }
+    if args.use_fused_adamw and device.type == "cuda":
+        optimizer_kwargs["fused"] = True
+
+    try:
+        optimizer = torch.optim.AdamW(
+            model.model.parameters(),
+            **optimizer_kwargs,
+        )
+        if optimizer_kwargs.get("fused"):
+            print("Using fused AdamW CUDA kernels")
+    except TypeError:
+        optimizer_kwargs.pop("fused", None)
+        optimizer = torch.optim.AdamW(
+            model.model.parameters(),
+            **optimizer_kwargs,
+        )
+        print("Fused AdamW unsupported in this torch build; using standard AdamW")
 
     # ------------------------------------------------------------------
     # Training loop

@@ -66,7 +66,13 @@ python train.py \
    --num_rollouts 4 \
    --ema_decay 0.999 \
    --gamma 0.1 \
-   --batch_size 2 \
+   --batch_size 4 \
+   --num_workers 4 \
+   --persistent_workers \
+   --pin_memory \
+   --use_fused_adamw \
+   --use_flash_attention \
+   --compile_model \
    --lr 1e-5 \
    --max_steps 10000 \
    --output_dir ./output
@@ -83,7 +89,13 @@ python train.py \
 | `--gamma` | `0.1` | Weight of the CE term |
 | `--temperature` | `1.0` | Sampling temperature |
 | `--dtype` | `float32` | `float32` / `bfloat16` / `float16` |
+| `--use_fused_adamw` | `true` | Use fused CUDA AdamW kernels when available |
+| `--use_flash_attention` | `true` | Request FlashAttention v2 on supported CUDA setups |
+| `--compile_model` | `true` | Compile generator with `torch.compile` |
+| `--compile_mode` | `reduce-overhead` | `torch.compile` mode |
 | `--pin_memory` | auto (`true` on CUDA, `false` on CPU) | Enable pinned host memory in the DataLoader for faster GPU transfer |
+| `--num_workers` | auto | DataLoader worker count (auto-tuned by device) |
+| `--persistent_workers` | auto | Reuse workers (and pinned buffers) across batches |
 | `--max_documents` | `None` | Optional cap on raw documents tokenized before chunking |
 | `--max_tokens` | `None` | Optional cap on total tokens accumulated before chunking |
 
