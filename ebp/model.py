@@ -183,6 +183,28 @@ def _get_transformer_layers(model: nn.Module) -> nn.ModuleList:
     )
 
 
+def _features_from_hidden_states(
+    hidden_states: Tuple[torch.Tensor, ...],
+    feature_layer_indices: Sequence[int],
+    attention_mask: Optional[torch.Tensor],
+    completion_start: Optional[int],
+    detach: bool,
+) -> torch.Tensor:
+    """Build concatenated pooled features from model hidden states.
+
+    HuggingFace models return ``hidden_states`` as a tuple where index 0 is
+    the embedding output and index ``i + 1`` corresponds to transformer block
+    ``i``.  ``feature_layer_indices`` are block indices.
+    """
+    blocks = []
+    for idx in feature_layer_indices:
+        h = hidden_states[idx + 1]
+        if detach:
+            h = h.detach()
+        blocks.append(_pool_hidden_state(h, attention_mask, completion_start))
+    return torch.cat(blocks, dim=-1)
+
+
 # ---------------------------------------------------------------------------
 # EMAEBPModel
 # ---------------------------------------------------------------------------
@@ -277,8 +299,8 @@ class EMAEBPModel(nn.Module):
     ) -> torch.Tensor:
         """Extract features from the EMA model (no gradient).
 
-        Registers forward hooks on the target layers, runs a single forward
-        pass through ``ema_model``, and returns the concatenation of the
+        Runs a single forward pass through ``ema_model`` with
+        ``output_hidden_states=True`` and returns the concatenation of the
         per-layer mean-pooled, L2-normalised hidden states.
 
         Args:
@@ -289,35 +311,20 @@ class EMAEBPModel(nn.Module):
         Returns:
             ``(B, D * num_feature_layers)`` feature tensor (detached).
         """
-        captured: dict = {}
-        hooks = []
+        outputs = self.ema_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
 
-        def make_hook(key: int):
-            def hook_fn(module, inp, output):
-                h = output[0] if isinstance(output, tuple) else output
-                captured[key] = h.detach()
-
-            return hook_fn
-
-        for idx in self.feature_layer_indices:
-            hooks.append(self._ema_layers[idx].register_forward_hook(make_hook(idx)))
-
-        try:
-            self.ema_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-            )
-        finally:
-            for hook in hooks:
-                hook.remove()
-
-        return torch.cat(
-            [
-                _pool_hidden_state(captured[idx], attention_mask, completion_start)
-                for idx in self.feature_layer_indices
-            ],
-            dim=-1,
+        return _features_from_hidden_states(
+            hidden_states=outputs.hidden_states,
+            feature_layer_indices=self.feature_layer_indices,
+            attention_mask=attention_mask,
+            completion_start=completion_start,
+            detach=True,
         )  # (B, D * K)
 
     # ------------------------------------------------------------------
@@ -482,11 +489,6 @@ class OnlineEBPModel(nn.Module):
         else:
             self.model = AutoModelForCausalLM.from_pretrained(model_name)
 
-        # Preserve an eager reference for hook-based feature capture.
-        # If self.model is later replaced by torch.compile(...), hooks on
-        # compiled graphs may not fire for every expected layer.
-        self._feature_model = self.model
-
         self.feature_layer_fractions = tuple(feature_layer_fractions)
 
         num_layers = len(_get_transformer_layers(self.model))
@@ -494,7 +496,8 @@ class OnlineEBPModel(nn.Module):
             max(0, min(round(f * num_layers) - 1, num_layers - 1))
             for f in self.feature_layer_fractions
         ]
-        self._model_layers = _get_transformer_layers(self._feature_model)
+        # Kept for compatibility with tests that inspect selected layer range.
+        self._model_layers = _get_transformer_layers(self.model)
 
     # ------------------------------------------------------------------
     # Forward (trainable generator)
@@ -540,35 +543,20 @@ class OnlineEBPModel(nn.Module):
         Returns:
             ``(B, D * num_feature_layers)`` feature tensor (detached).
         """
-        captured: dict = {}
-        hooks = []
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
 
-        def make_hook(key: int):
-            def hook_fn(module, inp, output):
-                h = output[0] if isinstance(output, tuple) else output
-                captured[key] = h.detach()
-
-            return hook_fn
-
-        for idx in self.feature_layer_indices:
-            hooks.append(self._model_layers[idx].register_forward_hook(make_hook(idx)))
-
-        try:
-            self._feature_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-            )
-        finally:
-            for hook in hooks:
-                hook.remove()
-
-        return torch.cat(
-            [
-                _pool_hidden_state(captured[idx], attention_mask, completion_start)
-                for idx in self.feature_layer_indices
-            ],
-            dim=-1,
+        return _features_from_hidden_states(
+            hidden_states=outputs.hidden_states,
+            feature_layer_indices=self.feature_layer_indices,
+            attention_mask=attention_mask,
+            completion_start=completion_start,
+            detach=True,
         )
 
     # ------------------------------------------------------------------
@@ -583,10 +571,9 @@ class OnlineEBPModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Single forward pass returning both features and log-probabilities.
 
-        Forward hooks capture intermediate hidden states (immediately
-        ``.detach()``-ed so no gradient flows through the features), while
-        the output logits retain the computational graph for the REINFORCE
-        gradient through log-probabilities.
+        A single forward call returns both hidden states and logits. Features
+        are detached immediately so no gradient flows through them, while
+        logits retain the graph for REINFORCE gradients.
 
         This is the core efficiency gain of :class:`OnlineEBPModel`: instead
         of two separate forward passes (EMA for features + generator for
@@ -601,36 +588,20 @@ class OnlineEBPModel(nn.Module):
             features:  ``(B, D * K)`` - detached feature vectors (no grad).
             log_probs: ``(B,)`` - differentiable summed log-probabilities.
         """
-        captured: dict = {}
-        hooks = []
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
 
-        def make_hook(key: int):
-            def hook_fn(module, inp, output):
-                h = output[0] if isinstance(output, tuple) else output
-                # Detach immediately so the feature vector is stop-gradient
-                captured[key] = h.detach()
-
-            return hook_fn
-
-        for idx in self.feature_layer_indices:
-            hooks.append(self._model_layers[idx].register_forward_hook(make_hook(idx)))
-
-        try:
-            outputs = self._feature_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-            )
-        finally:
-            for hook in hooks:
-                hook.remove()
-
-        features = torch.cat(
-            [
-                _pool_hidden_state(captured[idx], attention_mask, completion_start)
-                for idx in self.feature_layer_indices
-            ],
-            dim=-1,
+        features = _features_from_hidden_states(
+            hidden_states=outputs.hidden_states,
+            feature_layer_indices=self.feature_layer_indices,
+            attention_mask=attention_mask,
+            completion_start=completion_start,
+            detach=True,
         )  # (B, D * K), detached
 
         log_probs = _sum_completion_log_probs(

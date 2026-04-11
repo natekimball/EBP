@@ -392,12 +392,28 @@ def training_step(
     full_ids = torch.cat([context_ids, completion_ids], dim=1)
     full_mask = torch.cat([context_mask, completion_mask], dim=1)
 
-    model.eval()
-    _reset_cuda_peak("ref")
-    ref_features = model.extract_features(
-        full_ids, full_mask, completion_start=context_len
-    )  # (B, feat_dim)
-    _record_cuda_peak("ref")
+    ce_loss: torch.Tensor | None = None
+    used_combined_ref_ce = False
+
+    # In online mode with gamma > 0, compute CE and reference features
+    # together to avoid a redundant full-sequence forward pass.
+    if isinstance(model, OnlineEBPModel) and gamma > 0.0:
+        model.train()
+        _reset_cuda_peak("ref")
+        ce_loss, ref_features = model.forward_ce_and_ref_features(
+            full_ids,
+            full_mask,
+            completion_start=context_len,
+        )
+        _record_cuda_peak("ref")
+        used_combined_ref_ce = True
+    else:
+        model.eval()
+        _reset_cuda_peak("ref")
+        ref_features = model.extract_features(
+            full_ids, full_mask, completion_start=context_len
+        )  # (B, feat_dim)
+        _record_cuda_peak("ref")
 
     # ------------------------------------------------------------------
     # 2. Generate rollouts  y_hat_j ~ p_theta(.|c)
@@ -459,12 +475,18 @@ def training_step(
     ce_loss_val = 0.0
 
     if gamma > 0.0:
-        _reset_cuda_peak("ce_fwd")
-        ce_out = model(input_ids=full_ids, attention_mask=full_mask, labels=full_ids)
-        ce_loss = ce_out.loss
+        if ce_loss is None:
+            _reset_cuda_peak("ce_fwd")
+            ce_out = model(input_ids=full_ids, attention_mask=full_mask, labels=full_ids)
+            ce_loss = ce_out.loss
+            _record_cuda_peak("ce_fwd")
+        elif used_combined_ref_ce and log_cuda_memory and device.type == "cuda":
+            # Combined pass already measured in the "ref" stage.
+            cuda_mem["ce_fwd_alloc_mb"] = cuda_mem.get("ref_alloc_mb", 0.0)
+            cuda_mem["ce_fwd_reserved_mb"] = cuda_mem.get("ref_reserved_mb", 0.0)
+
         total_loss = total_loss + gamma * ce_loss
         ce_loss_val = ce_loss.item()
-        _record_cuda_peak("ce_fwd")
 
     result = {
         "loss": total_loss,
