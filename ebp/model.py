@@ -482,6 +482,11 @@ class OnlineEBPModel(nn.Module):
         else:
             self.model = AutoModelForCausalLM.from_pretrained(model_name)
 
+        # Preserve an eager reference for hook-based feature capture.
+        # If self.model is later replaced by torch.compile(...), hooks on
+        # compiled graphs may not fire for every expected layer.
+        self._feature_model = self.model
+
         self.feature_layer_fractions = tuple(feature_layer_fractions)
 
         num_layers = len(_get_transformer_layers(self.model))
@@ -489,7 +494,7 @@ class OnlineEBPModel(nn.Module):
             max(0, min(round(f * num_layers) - 1, num_layers - 1))
             for f in self.feature_layer_fractions
         ]
-        self._model_layers = _get_transformer_layers(self.model)
+        self._model_layers = _get_transformer_layers(self._feature_model)
 
     # ------------------------------------------------------------------
     # Forward (trainable generator)
@@ -549,7 +554,7 @@ class OnlineEBPModel(nn.Module):
             hooks.append(self._model_layers[idx].register_forward_hook(make_hook(idx)))
 
         try:
-            self.model(
+            self._feature_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 use_cache=False,
@@ -611,7 +616,7 @@ class OnlineEBPModel(nn.Module):
             hooks.append(self._model_layers[idx].register_forward_hook(make_hook(idx)))
 
         try:
-            outputs = self.model(
+            outputs = self._feature_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 use_cache=False,
