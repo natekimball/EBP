@@ -7,13 +7,22 @@ the feature network.
 """
 
 from ebp.model import EMAEBPModel, OnlineEBPModel
-from ebp.rewards import compute_feature_matching_rewards, compute_rloo_baseline
+from ebp.rewards import (
+    compute_feature_matching_rewards,
+    compute_feature_matching_rewards_batched,
+    compute_feature_matching_terms_batched,
+    compute_rloo_baseline,
+    compute_rloo_baseline_batched,
+)
 from ebp.data import PretrainingDataset
 
 __all__ = [
     "EMAEBPModel",
     "OnlineEBPModel",
     "compute_feature_matching_rewards",
+    "compute_feature_matching_rewards_batched",
+    "compute_feature_matching_terms_batched",
     "compute_rloo_baseline",
+    "compute_rloo_baseline_batched",
     "PretrainingDataset",
 ]

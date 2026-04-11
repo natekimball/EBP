@@ -13,7 +13,13 @@ import torch
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from ebp.model import EMAEBPModel, OnlineEBPModel
-from ebp.rewards import compute_feature_matching_rewards, compute_rloo_baseline
+from ebp.rewards import (
+    compute_feature_matching_rewards,
+    compute_feature_matching_rewards_batched,
+    compute_feature_matching_terms_batched,
+    compute_rloo_baseline,
+    compute_rloo_baseline_batched,
+)
 from ebp.data import collate_fn
 
 
@@ -449,6 +455,113 @@ class TestComputeRLOOBaseline(unittest.TestCase):
         rewards = torch.randn(6)
         adv = rewards - compute_rloo_baseline(rewards)
         self.assertAlmostEqual(adv.sum().item(), 0.0, places=5)
+
+
+# ---------------------------------------------------------------------------
+# Tests: batched reward and baseline computation
+# ---------------------------------------------------------------------------
+
+
+class TestComputeFeatureMatchingRewardsBatched(unittest.TestCase):
+    """Tests for the vectorized batch variants of reward computation."""
+
+    def _make_inputs(self, batch_size: int = 3, num_rollouts: int = 4, d: int = 16):
+        rollout_features = torch.randn(batch_size * num_rollouts, d)
+        ref_features = torch.randn(batch_size, d)
+        return rollout_features, ref_features
+
+    def test_output_shape(self):
+        rf, ref = self._make_inputs()
+        rewards = compute_feature_matching_rewards_batched(rf, ref, num_rollouts=4)
+        self.assertEqual(rewards.shape, (3 * 4,))
+
+    def test_matches_per_item_loop(self):
+        """Batched result must match the per-item result for every rollout."""
+        batch_size, n, d = 3, 4, 16
+        rf, ref = self._make_inputs(batch_size, n, d)
+
+        rewards_batched = compute_feature_matching_rewards_batched(rf, ref, num_rollouts=n)
+
+        for i in range(batch_size):
+            item_rf = rf[i * n : (i + 1) * n]
+            item_ref = ref[i]
+            rewards_item = compute_feature_matching_rewards(item_rf, item_ref)
+            torch.testing.assert_close(
+                rewards_batched[i * n : (i + 1) * n], rewards_item
+            )
+
+    def test_single_rollout_no_diversity(self):
+        """With n=1 the diversity term is zero so reward = alignment."""
+        batch_size, d = 2, 8
+        rf = torch.randn(batch_size, d)
+        ref = torch.randn(batch_size, d)
+        rewards = compute_feature_matching_rewards_batched(rf, ref, num_rollouts=1)
+        # alignment = 2 * dot(rf[i], ref[i]) for each i
+        for i in range(batch_size):
+            expected = 2.0 * (rf[i] * ref[i]).sum()
+            self.assertAlmostEqual(rewards[i].item(), expected.item(), places=5)
+
+    def test_invalid_rollout_dim_raises(self):
+        with self.assertRaises(ValueError):
+            compute_feature_matching_rewards_batched(
+                torch.randn(12), torch.randn(3, 4), num_rollouts=4
+            )
+
+    def test_invalid_ref_dim_raises(self):
+        with self.assertRaises(ValueError):
+            compute_feature_matching_rewards_batched(
+                torch.randn(12, 8), torch.randn(8), num_rollouts=4
+            )
+
+    def test_mismatch_batch_size_raises(self):
+        with self.assertRaises(ValueError):
+            compute_feature_matching_rewards_batched(
+                torch.randn(12, 8), torch.randn(4, 8), num_rollouts=4
+            )
+
+    def test_non_divisible_rollouts_raises(self):
+        with self.assertRaises(ValueError):
+            compute_feature_matching_rewards_batched(
+                torch.randn(10, 8), torch.randn(3, 8), num_rollouts=4
+            )
+
+
+class TestComputeRLOOBaselineBatched(unittest.TestCase):
+    """Tests for the vectorized batch variant of the RLOO baseline."""
+
+    def test_output_shape(self):
+        b = compute_rloo_baseline_batched(torch.randn(3 * 4), num_rollouts=4)
+        self.assertEqual(b.shape, (3 * 4,))
+
+    def test_matches_per_item_loop(self):
+        """Batched result must match computing per-item baselines independently."""
+        batch_size, n = 3, 4
+        rewards = torch.randn(batch_size * n)
+
+        baselines_batched = compute_rloo_baseline_batched(rewards, num_rollouts=n)
+
+        for i in range(batch_size):
+            item_r = rewards[i * n : (i + 1) * n]
+            item_b = compute_rloo_baseline(item_r)
+            torch.testing.assert_close(baselines_batched[i * n : (i + 1) * n], item_b)
+
+    def test_single_rollout_gives_zero(self):
+        rewards = torch.tensor([1.0, 2.0, 3.0])  # B=3, n=1
+        b = compute_rloo_baseline_batched(rewards, num_rollouts=1)
+        torch.testing.assert_close(b, torch.zeros(3))
+
+    def test_advantages_zero_sum_per_context(self):
+        """Advantages (reward - baseline) must sum to zero within each context."""
+        batch_size, n = 4, 5
+        rewards = torch.randn(batch_size * n)
+        baselines = compute_rloo_baseline_batched(rewards, num_rollouts=n)
+        adv = (rewards - baselines).reshape(batch_size, n)
+        for i in range(batch_size):
+            self.assertAlmostEqual(adv[i].sum().item(), 0.0, places=5)
+
+    def test_non_divisible_rewards_raises(self):
+        with self.assertRaises(ValueError):
+            compute_rloo_baseline_batched(torch.randn(10), num_rollouts=4)
 
 
 # ---------------------------------------------------------------------------

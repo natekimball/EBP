@@ -83,7 +83,7 @@ from transformers import AutoTokenizer
 
 from ebp.data import PretrainingDataset, collate_fn
 from ebp.model import EMAEBPModel, OnlineEBPModel
-from ebp.rewards import compute_feature_matching_terms, compute_rloo_baseline
+from ebp.rewards import compute_feature_matching_terms_batched, compute_rloo_baseline_batched
 
 
 # ---------------------------------------------------------------------------
@@ -431,33 +431,21 @@ def training_step(
     # ------------------------------------------------------------------
     # 4. Feature-matching rewards and REINFORCE loss
     # ------------------------------------------------------------------
-    reinforce_loss = torch.tensor(0.0, device=device)
-    all_rewards: List[torch.Tensor] = []
-    all_alignment: List[torch.Tensor] = []
-    all_diversity: List[torch.Tensor] = []
+    alignment, diversity = compute_feature_matching_terms_batched(
+        rollout_features, ref_features, num_rollouts
+    )
+    rewards = alignment - diversity  # (B * n,)
 
-    for i in range(batch_size):
-        item_feat = rollout_features[i * num_rollouts : (i + 1) * num_rollouts]
-        item_ref = ref_features[i]  # (feat_dim,)
-        item_lp = rollout_log_probs[i * num_rollouts : (i + 1) * num_rollouts]
+    baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
+    advantages = (rewards - baselines).detach()  # stop-gradient on advantages
 
-        alignment, diversity = compute_feature_matching_terms(item_feat, item_ref)
-        rewards = alignment - diversity
-        all_rewards.append(rewards.detach())
-        all_alignment.append(alignment.detach())
-        all_diversity.append(diversity.detach())
-        baselines = compute_rloo_baseline(rewards)
-        advantages = (rewards - baselines).detach()  # stop-gradient on advantages
+    # REINFORCE: maximise E[advantage * log p]  ->  minimise negation
+    reinforce_loss = -(advantages * rollout_log_probs).mean()
 
-        # REINFORCE: maximise E[advantage * log p]  ->  minimise negation
-        reinforce_loss = reinforce_loss - (advantages * item_lp).mean()
-
-    reinforce_loss = reinforce_loss / batch_size
-
-    # Mean reward across all rollouts (diagnostic)
-    mean_reward = torch.cat(all_rewards).mean().item()
-    mean_alignment = torch.cat(all_alignment).mean().item()
-    mean_diversity = torch.cat(all_diversity).mean().item()
+    # Mean reward / alignment / diversity across all rollouts (diagnostics)
+    mean_reward = rewards.detach().mean().item()
+    mean_alignment = alignment.detach().mean().item()
+    mean_diversity = diversity.detach().mean().item()
 
     # Per-token NLL of rollout sequences (proxy for policy entropy).
     # NLL = -mean(log p) / gen_len.  By Jensen's inequality, H(p) ≥ NLL,
