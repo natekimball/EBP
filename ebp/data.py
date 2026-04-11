@@ -40,7 +40,8 @@ class PretrainingDataset(Dataset):
     Args:
         tokenizer: HuggingFace tokeniser used for encoding.
         dataset_name: Dataset name passed to ``datasets.load_dataset``.
-        dataset_config: Dataset configuration / subset name.
+        dataset_config: Dataset configuration / subset name, or ``None`` if the
+            dataset has no named configuration.
         split: Dataset split (e.g. ``"train"``).
         context_length: Number of tokens used as conditioning context.
         completion_length: Number of tokens used as the ground-truth
@@ -50,47 +51,101 @@ class PretrainingDataset(Dataset):
         min_doc_chars: Minimum character length required for a document to
             be included.
         text_column: Name of the text column in the dataset.
+        streaming: Whether to stream documents from the dataset backend.
+        max_documents: Optional cap on number of documents to tokenise.
+        max_tokens: Optional cap on total concatenated tokens before chunking.
+        max_examples: Optional cap on number of produced training chunks.
     """
 
     def __init__(
         self,
         tokenizer: PreTrainedTokenizerBase,
-        dataset_name: str = "wikitext",
-        dataset_config: str = "wikitext-2-raw-v1",
+        dataset_name: str = "allenai/dolma",
+        dataset_config: Optional[str] = "v1_7",
         split: str = "train",
         context_length: int = 128,
         completion_length: int = 32,
         stride: Optional[int] = None,
         min_doc_chars: int = 50,
         text_column: str = "text",
+        streaming: bool = True,
+        max_documents: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        max_examples: Optional[int] = None,
     ) -> None:
         self.context_length = context_length
         self.completion_length = completion_length
         chunk_size = context_length + completion_length
         stride = stride if stride is not None else chunk_size
 
-        raw = load_dataset(dataset_name, dataset_config, split=split)
+        raw = load_dataset(
+            dataset_name,
+            dataset_config,
+            split=split,
+            trust_remote_code=True,
+            streaming=streaming,
+        )
 
         # EOS token used as a document separator so that no chunk spans
         # two documents.  When eos_token_id is None (rare) we skip separators.
         eos_id: Optional[int] = tokenizer.eos_token_id
 
-        # Concatenate document tokens separated by EOS, so the model never
-        # predicts tokens from one document given context from another.
-        all_tokens: List[int] = []
+        # Stream documents and incrementally build chunks so startup does not
+        # require tokenising the entire corpus before creating examples.
+        token_buffer: List[int] = []
+        buffer_start = 0
+        accepted_docs = 0
+        total_tokens = 0
+        have_previous_doc = False
+        self.examples: List[List[int]] = []
+
         for item in raw:
+            if max_documents is not None and accepted_docs >= max_documents:
+                break
+            if max_tokens is not None and total_tokens >= max_tokens:
+                break
+            if max_examples is not None and len(self.examples) >= max_examples:
+                break
+
             text = item[text_column]
             if len(text.strip()) < min_doc_chars:
                 continue
-            tokens = tokenizer.encode(text, add_special_tokens=False)
-            if all_tokens and eos_id is not None:
-                all_tokens.append(eos_id)
-            all_tokens.extend(tokens)
 
-        # Create fixed-length chunks via sliding window
-        self.examples: List[List[int]] = []
-        for start in range(0, len(all_tokens) - chunk_size + 1, stride):
-            self.examples.append(all_tokens[start : start + chunk_size])
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+            doc_tokens: List[int] = tokens
+            if have_previous_doc and eos_id is not None:
+                doc_tokens = [eos_id] + doc_tokens
+
+            if max_tokens is not None:
+                remaining = max_tokens - total_tokens
+                if remaining <= 0:
+                    break
+                doc_tokens = doc_tokens[:remaining]
+
+            if not doc_tokens:
+                continue
+
+            token_buffer.extend(doc_tokens)
+            total_tokens += len(doc_tokens)
+            accepted_docs += 1
+            have_previous_doc = True
+
+            while len(token_buffer) - buffer_start >= chunk_size:
+                end = buffer_start + chunk_size
+                self.examples.append(token_buffer[buffer_start:end])
+
+                if max_examples is not None and len(self.examples) >= max_examples:
+                    break
+
+                buffer_start += stride
+
+            if max_examples is not None and len(self.examples) >= max_examples:
+                break
+
+            # Periodically trim consumed prefix to keep memory bounded.
+            if buffer_start > 4096:
+                token_buffer = token_buffer[buffer_start:]
+                buffer_start = 0
 
     # ------------------------------------------------------------------
 

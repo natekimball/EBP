@@ -57,18 +57,19 @@ tests/
 pip install -r requirements.txt
 
 python train.py \
-    --model_name Qwen/Qwen3-0.6B \
-    --dataset_name wikitext \
-    --dataset_config wikitext-2-raw-v1 \
-    --context_length 128 \
-    --generation_length 8 \
-    --num_rollouts 4 \
-    --ema_decay 0.999 \
-    --gamma 0.1 \
-    --batch_size 2 \
-    --lr 1e-5 \
-    --max_steps 10000 \
-    --output_dir ./output
+   --model_name Qwen/Qwen3-0.6B \
+   --dataset_name allenai/dolma \
+   --dataset_config v1_7 \
+   --max_documents 200000 \
+   --context_length 128 \
+   --generation_length 8 \
+   --num_rollouts 4 \
+   --ema_decay 0.999 \
+   --gamma 0.1 \
+   --batch_size 2 \
+   --lr 1e-5 \
+   --max_steps 10000 \
+   --output_dir ./output
 ```
 
 ### Key arguments
@@ -82,6 +83,9 @@ python train.py \
 | `--gamma` | `0.1` | Weight of the CE term |
 | `--temperature` | `1.0` | Sampling temperature |
 | `--dtype` | `float32` | `float32` / `bfloat16` / `float16` |
+| `--pin_memory` | auto (`true` on CUDA, `false` on CPU) | Enable pinned host memory in the DataLoader for faster GPU transfer |
+| `--max_documents` | `None` | Optional cap on raw documents tokenized before chunking |
+| `--max_tokens` | `None` | Optional cap on total tokens accumulated before chunking |
 
 ---
 

@@ -114,9 +114,37 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     # Data
-    parser.add_argument("--dataset_name", type=str, default="wikitext")
-    parser.add_argument("--dataset_config", type=str, default="wikitext-2-raw-v1")
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default="allenai/dolma",
+    )
+    parser.add_argument("--dataset_config", type=str, default="v1_7")
     parser.add_argument("--dataset_split", type=str, default="train")
+    parser.add_argument(
+        "--streaming",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream dataset samples instead of loading split materialization upfront.",
+    )
+    parser.add_argument(
+        "--max_documents",
+        type=int,
+        default=None,
+        help="Optional cap on number of raw documents tokenised from the dataset.",
+    )
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=None,
+        help="Optional cap on total concatenated tokens before chunking.",
+    )
+    parser.add_argument(
+        "--max_examples",
+        type=int,
+        default=None,
+        help="Optional cap on number of fixed-length training examples to build.",
+    )
     # Sequence lengths
     parser.add_argument(
         "--context_length",
@@ -196,6 +224,15 @@ def parse_args() -> argparse.Namespace:
             "activation memory (slight speed tradeoff)."
         ),
     )
+    parser.add_argument(
+        "--pin_memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Whether to use DataLoader pinned host memory for faster CPU->GPU "
+            "transfer. Defaults to enabled on CUDA and disabled on CPU."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -236,10 +273,11 @@ def training_step(
         ``mean_reward``, and ``entropy`` (mean per-token negative log-prob of
         rollout sequences, a proxy for the policy entropy).
     """
-    context_ids = batch["context_ids"].to(device)
-    context_mask = batch["context_mask"].to(device)
-    completion_ids = batch["completion_ids"].to(device)
-    completion_mask = batch["completion_mask"].to(device)
+    non_blocking = device.type == "cuda"
+    context_ids = batch["context_ids"].to(device, non_blocking=non_blocking)
+    context_mask = batch["context_mask"].to(device, non_blocking=non_blocking)
+    completion_ids = batch["completion_ids"].to(device, non_blocking=non_blocking)
+    completion_mask = batch["completion_mask"].to(device, non_blocking=non_blocking)
 
     batch_size = context_ids.shape[0]
     context_len = context_ids.shape[1]
@@ -250,6 +288,7 @@ def training_step(
     full_ids = torch.cat([context_ids, completion_ids], dim=1)
     full_mask = torch.cat([context_mask, completion_mask], dim=1)
 
+    model.eval()
     ref_features = model.extract_features(
         full_ids, full_mask, completion_start=context_len
     )  # (B, feat_dim)
@@ -272,6 +311,7 @@ def training_step(
     #    EMAEBPModel:    two forward passes (EMA features + generator log-probs)
     #    OnlineEBPModel: one forward pass (features detached + log-probs with grad)
     # ------------------------------------------------------------------
+    model.train()
     rollout_features, rollout_log_probs = model.compute_rollout_data(
         rollout_ids, rollout_masks, completion_start=context_len
     )
@@ -406,8 +446,15 @@ def train(args: argparse.Namespace) -> None:
         split=args.dataset_split,
         context_length=args.context_length,
         completion_length=args.generation_length,
+        streaming=args.streaming,
+        max_documents=args.max_documents,
+        max_tokens=args.max_tokens,
+        max_examples=args.max_examples,
     )
     print(f"Dataset size: {len(dataset)} examples")
+
+    pin_memory = args.pin_memory if args.pin_memory is not None else device.type == "cuda"
+    print(f"DataLoader pin_memory: {pin_memory}")
 
     dataloader = DataLoader(
         dataset,
@@ -415,6 +462,7 @@ def train(args: argparse.Namespace) -> None:
         shuffle=True,
         collate_fn=partial(collate_fn, pad_token_id=pad_id),
         drop_last=True,
+        pin_memory=pin_memory,
     )
 
     # ------------------------------------------------------------------

@@ -767,6 +767,7 @@ def _generate_with_kv_cache(
             use_cache=True,
             return_dict=True,
         )
+
         expanded_pkv = _expand_kv_cache(prefix_out.past_key_values, num_rollouts)
 
         # Last context token serves as the first input to generate()
