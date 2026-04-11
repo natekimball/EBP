@@ -294,6 +294,15 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Pass fullgraph=True to torch.compile.",
     )
+    parser.add_argument(
+        "--log_cuda_memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Log per-stage CUDA peak memory (allocated and reserved) at the "
+            "same cadence as --log_steps."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -332,6 +341,7 @@ def training_step(
     gamma: float,
     temperature: float,
     device: torch.device,
+    log_cuda_memory: bool = False,
 ) -> dict:
     """Execute one EBP training step.
 
@@ -365,6 +375,17 @@ def training_step(
     batch_size = context_ids.shape[0]
     context_len = context_ids.shape[1]
 
+    cuda_mem = {}
+
+    def _reset_cuda_peak(tag: str) -> None:
+        if log_cuda_memory and device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+
+    def _record_cuda_peak(tag: str) -> None:
+        if log_cuda_memory and device.type == "cuda":
+            cuda_mem[f"{tag}_alloc_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            cuda_mem[f"{tag}_reserved_mb"] = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+
     # ------------------------------------------------------------------
     # 1. Reference features  phi(c:y)
     # ------------------------------------------------------------------
@@ -372,13 +393,16 @@ def training_step(
     full_mask = torch.cat([context_mask, completion_mask], dim=1)
 
     model.eval()
+    _reset_cuda_peak("ref")
     ref_features = model.extract_features(
         full_ids, full_mask, completion_start=context_len
     )  # (B, feat_dim)
+    _record_cuda_peak("ref")
 
     # ------------------------------------------------------------------
     # 2. Generate rollouts  y_hat_j ~ p_theta(.|c)
     # ------------------------------------------------------------------
+    _reset_cuda_peak("gen")
     rollout_ids, rollout_masks = model.generate_rollouts(
         context_ids=context_ids,
         context_attention_mask=context_mask,
@@ -386,6 +410,7 @@ def training_step(
         generation_length=generation_length,
         temperature=temperature,
     )
+    _record_cuda_peak("gen")
     # rollout_ids:   (B * n, context_len + generation_length)
     # rollout_masks: (B * n, context_len + generation_length)
 
@@ -395,9 +420,11 @@ def training_step(
     #    OnlineEBPModel: one forward pass (features detached + log-probs with grad)
     # ------------------------------------------------------------------
     model.train()
+    _reset_cuda_peak("rollout_fwd")
     rollout_features, rollout_log_probs = model.compute_rollout_data(
         rollout_ids, rollout_masks, completion_start=context_len
     )
+    _record_cuda_peak("rollout_fwd")
     # rollout_features:  (B * n, feat_dim)  - detached
     # rollout_log_probs: (B * n,)           - differentiable
 
@@ -444,12 +471,14 @@ def training_step(
     ce_loss_val = 0.0
 
     if gamma > 0.0:
+        _reset_cuda_peak("ce_fwd")
         ce_out = model(input_ids=full_ids, attention_mask=full_mask, labels=full_ids)
         ce_loss = ce_out.loss
         total_loss = total_loss + gamma * ce_loss
         ce_loss_val = ce_loss.item()
+        _record_cuda_peak("ce_fwd")
 
-    return {
+    result = {
         "loss": total_loss,
         "reinforce_loss": reinforce_loss.item(),
         "ce_loss": ce_loss_val,
@@ -459,6 +488,9 @@ def training_step(
         # Logged as "entropy"; computed as per-token NLL (lower bound on H(p))
         "entropy": policy_nll,
     }
+    if cuda_mem:
+        result["cuda_mem"] = cuda_mem
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -655,12 +687,31 @@ def train(args: argparse.Namespace) -> None:
                 gamma=args.gamma,
                 temperature=args.temperature,
                 device=device,
+                log_cuda_memory=args.log_cuda_memory,
             )
 
             optimizer.zero_grad(set_to_none=True)
+            if args.log_cuda_memory and device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
             result["loss"].backward()
+            if args.log_cuda_memory and device.type == "cuda":
+                result.setdefault("cuda_mem", {})["backward_alloc_mb"] = (
+                    torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                )
+                result.setdefault("cuda_mem", {})["backward_reserved_mb"] = (
+                    torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+                )
             torch.nn.utils.clip_grad_norm_(model.model.parameters(), args.grad_clip)
+            if args.log_cuda_memory and device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
             optimizer.step()
+            if args.log_cuda_memory and device.type == "cuda":
+                result.setdefault("cuda_mem", {})["opt_step_alloc_mb"] = (
+                    torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                )
+                result.setdefault("cuda_mem", {})["opt_step_reserved_mb"] = (
+                    torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+                )
 
             # Update EMA feature network (only for EMAEBPModel)
             if isinstance(model, EMAEBPModel):
@@ -696,6 +747,18 @@ def train(args: argparse.Namespace) -> None:
                     f"div={result['mean_diversity']:.4f} "
                     f"entropy={result['entropy']:.4f}"
                 )
+                if args.log_cuda_memory and device.type == "cuda" and "cuda_mem" in result:
+                    mem = result["cuda_mem"]
+                    mem_line = (
+                        "CUDA peak MB | "
+                        f"ref={mem.get('ref_alloc_mb', 0.0):.0f}/{mem.get('ref_reserved_mb', 0.0):.0f} "
+                        f"gen={mem.get('gen_alloc_mb', 0.0):.0f}/{mem.get('gen_reserved_mb', 0.0):.0f} "
+                        f"rollout_fwd={mem.get('rollout_fwd_alloc_mb', 0.0):.0f}/{mem.get('rollout_fwd_reserved_mb', 0.0):.0f} "
+                        f"ce_fwd={mem.get('ce_fwd_alloc_mb', 0.0):.0f}/{mem.get('ce_fwd_reserved_mb', 0.0):.0f} "
+                        f"backward={mem.get('backward_alloc_mb', 0.0):.0f}/{mem.get('backward_reserved_mb', 0.0):.0f} "
+                        f"opt={mem.get('opt_step_alloc_mb', 0.0):.0f}/{mem.get('opt_step_reserved_mb', 0.0):.0f}"
+                    )
+                    print(mem_line)
 
             if step % args.save_steps == 0:
                 save_path = os.path.join(args.output_dir, f"step_{step}")
