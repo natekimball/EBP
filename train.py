@@ -284,9 +284,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compile_mode",
         type=str,
-        default="reduce-overhead",
-        choices=["default", "reduce-overhead", "max-autotune"],
-        help="Compilation mode used by torch.compile.",
+        default=None,
+        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+        help=(
+            "Compilation mode for torch.compile. If not specified, defaults to "
+            "'default' when --memory_constrained is on, otherwise 'reduce-overhead'."
+        ),
     )
     parser.add_argument(
         "--compile_fullgraph",
@@ -301,6 +304,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Log per-stage CUDA peak memory (allocated and reserved) at the "
             "same cadence as --log_steps."
+        ),
+    )
+    parser.add_argument(
+        "--memory_constrained",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use the memory-constrained training step that backpropagates CE "
+            "early before rollout processing. Disable for the regular single-"
+            "backward step (typically higher throughput when memory allows)."
         ),
     )
     return parser.parse_args()
@@ -342,16 +355,13 @@ def training_step(
     temperature: float,
     device: torch.device,
     log_cuda_memory: bool = False,
-    early_ce_backward: bool = False,
 ) -> dict:
-    """Execute one EBP training step.
+    """Regular EBP training step with a single backward pass.
 
-    1. Extract reference features from the feature network (EMA or live model).
-    2. Generate ``num_rollouts`` completions per context (with prefix KV cache).
-    3. Compute rollout features + log-probs via ``model.compute_rollout_data``
-       (one forward pass for OnlineEBPModel; two for EMAEBPModel).
-    4. Compute REINFORCE loss with RLOO advantages.
-    5. Optionally add the cross-entropy term.
+    This path is throughput-oriented: CE and REINFORCE are combined into one
+    total loss and backpropagated once. For the online model with ``gamma > 0``,
+    the CE/ref combined forward is intentionally delayed until *after* rollout
+    generation and rollout processing to match the requested ordering.
 
     Args:
         model: Either :class:`EMAEBPModel` or :class:`OnlineEBPModel`.
@@ -388,56 +398,18 @@ def training_step(
             cuda_mem[f"{tag}_reserved_mb"] = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
 
     # ------------------------------------------------------------------
-    # 1. Reference features  phi(c:y)
+    # 1. Build full-sequence tensors used by ref/CE paths
     # ------------------------------------------------------------------
     full_ids = torch.cat([context_ids, completion_ids], dim=1)
     full_mask = torch.cat([context_mask, completion_mask], dim=1)
 
     ce_loss: torch.Tensor | None = None
-    ce_loss_val = 0.0
-    used_combined_ref_ce = False
-
-    # In online mode with gamma > 0, compute CE and reference features
-    # together to avoid a redundant full-sequence forward pass.
-    if isinstance(model, OnlineEBPModel) and gamma > 0.0:
-        model.train()
-        _reset_cuda_peak("ref")
-        ce_loss, ref_features = model.forward_ce_and_ref_features(
-            full_ids,
-            full_mask,
-            completion_start=context_len,
-        )
-        _record_cuda_peak("ref")
-        used_combined_ref_ce = True
-        ce_loss_val = ce_loss.item()
-
-        if early_ce_backward:
-            _reset_cuda_peak("ce_bwd_early")
-            (gamma * ce_loss).backward()
-            _record_cuda_peak("ce_bwd_early")
-    else:
-        model.eval()
-        _reset_cuda_peak("ref")
-        ref_features = model.extract_features(
-            full_ids, full_mask, completion_start=context_len
-        )  # (B, feat_dim)
-        _record_cuda_peak("ref")
-
-        if early_ce_backward and gamma > 0.0:
-            model.train()
-            _reset_cuda_peak("ce_fwd")
-            ce_out = model(input_ids=full_ids, attention_mask=full_mask, labels=full_ids)
-            ce_loss = ce_out.loss
-            ce_loss_val = ce_loss.item()
-            _record_cuda_peak("ce_fwd")
-
-            _reset_cuda_peak("ce_bwd_early")
-            (gamma * ce_loss).backward()
-            _record_cuda_peak("ce_bwd_early")
+    ref_features: torch.Tensor
 
     # ------------------------------------------------------------------
     # 2. Generate rollouts  y_hat_j ~ p_theta(.|c)
     # ------------------------------------------------------------------
+    model.eval()
     _reset_cuda_peak("gen")
     rollout_ids, rollout_masks = model.generate_rollouts(
         context_ids=context_ids,
@@ -465,7 +437,19 @@ def training_step(
     # rollout_log_probs: (B * n,)           - differentiable
 
     # ------------------------------------------------------------------
-    # 4. Feature-matching rewards and REINFORCE loss
+    # 4. Reference features and CE
+    # ------------------------------------------------------------------
+    _reset_cuda_peak("ref")
+    ce_loss, ref_features = model.forward_ce_and_ref_features(
+        full_ids,
+        full_mask,
+        completion_start=context_len,
+    )
+    _record_cuda_peak("ref")
+    ce_loss_val = ce_loss.item()
+
+    # ------------------------------------------------------------------
+    # 5. Feature-matching rewards and REINFORCE loss
     # ------------------------------------------------------------------
     alignment, diversity = compute_feature_matching_terms_batched(
         rollout_features, ref_features, num_rollouts
@@ -489,32 +473,128 @@ def training_step(
     policy_nll = (-rollout_log_probs.detach().mean() / max(generation_length, 1)).item()
 
     # ------------------------------------------------------------------
-    # 5. Optional cross-entropy term
+    # 6. Optional cross-entropy term
     # ------------------------------------------------------------------
     total_loss = reinforce_loss
 
     if gamma > 0.0:
-        if ce_loss is None and not early_ce_backward:
-            _reset_cuda_peak("ce_fwd")
-            ce_out = model(input_ids=full_ids, attention_mask=full_mask, labels=full_ids)
-            ce_loss = ce_out.loss
-            _record_cuda_peak("ce_fwd")
-            ce_loss_val = ce_loss.item()
-        elif used_combined_ref_ce and log_cuda_memory and device.type == "cuda":
-            # Combined pass already measured in the "ref" stage.
-            cuda_mem["ce_fwd_alloc_mb"] = cuda_mem.get("ref_alloc_mb", 0.0)
-            cuda_mem["ce_fwd_reserved_mb"] = cuda_mem.get("ref_reserved_mb", 0.0)
+        total_loss = total_loss + gamma * ce_loss
 
-        if early_ce_backward:
-            # CE term was already backpropagated to reduce peak VRAM.
-            total_loss = reinforce_loss + reinforce_loss.new_tensor(gamma * ce_loss_val)
-        else:
-            total_loss = total_loss + gamma * ce_loss
-
-    # Backward schedule lives in this function for a simpler outer loop.
-    backward_target = reinforce_loss if early_ce_backward else total_loss
     _reset_cuda_peak("backward")
-    backward_target.backward()
+    total_loss.backward()
+    _record_cuda_peak("backward")
+
+    result = {
+        "loss": total_loss.item(),
+        "reinforce_loss": reinforce_loss.item(),
+        "ce_loss": ce_loss_val,
+        "mean_reward": mean_reward,
+        "mean_alignment": mean_alignment,
+        "mean_diversity": mean_diversity,
+        # Logged as "entropy"; computed as per-token NLL (lower bound on H(p))
+        "entropy": policy_nll,
+    }
+    if cuda_mem:
+        result["cuda_mem"] = cuda_mem
+    return result
+
+
+def memory_constrained_training_step(
+    model: Union[EMAEBPModel, OnlineEBPModel],
+    batch: dict,
+    num_rollouts: int,
+    generation_length: int,
+    gamma: float,
+    temperature: float,
+    device: torch.device,
+    log_cuda_memory: bool = False,
+) -> dict:
+    """Memory-constrained EBP step with early CE backward.
+
+    This path reduces peak VRAM by backpropagating the CE term before rollout
+    tensors/activations are created.
+    """
+    non_blocking = device.type == "cuda"
+    context_ids = batch["context_ids"].to(device, non_blocking=non_blocking)
+    context_mask = batch["context_mask"].to(device, non_blocking=non_blocking)
+    completion_ids = batch["completion_ids"].to(device, non_blocking=non_blocking)
+    completion_mask = batch["completion_mask"].to(device, non_blocking=non_blocking)
+
+    context_len = context_ids.shape[1]
+    cuda_mem = {}
+
+    def _reset_cuda_peak(tag: str) -> None:
+        if log_cuda_memory and device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+
+    def _record_cuda_peak(tag: str) -> None:
+        if log_cuda_memory and device.type == "cuda":
+            cuda_mem[f"{tag}_alloc_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            cuda_mem[f"{tag}_reserved_mb"] = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+
+    full_ids = torch.cat([context_ids, completion_ids], dim=1)
+    full_mask = torch.cat([context_mask, completion_mask], dim=1)
+
+    # ------------------------------------------------------------------
+    # 1. Reference features and CE
+    # ------------------------------------------------------------------
+    # If using memory-constrained step, we compute CE here.
+    model.train()
+    _reset_cuda_peak("ref")
+    ce_loss, ref_features = model.forward_ce_and_ref_features(
+        full_ids,
+        full_mask,
+        completion_start=context_len,
+    )
+    _record_cuda_peak("ref")
+    ce_loss_val = ce_loss.item()
+
+    if gamma > 0.0:
+        _reset_cuda_peak("ce_bwd_early")
+        (gamma * ce_loss).backward()
+        _record_cuda_peak("ce_bwd_early")
+
+    # ------------------------------------------------------------------
+    # 2. Generate rollouts
+    # ------------------------------------------------------------------
+    model.eval()
+    rollout_ids, rollout_masks = model.generate_rollouts(
+        context_ids=context_ids,
+        context_attention_mask=context_mask,
+        num_rollouts=num_rollouts,
+        generation_length=generation_length,
+        temperature=temperature,
+    )
+    _record_cuda_peak("gen")
+
+    model.train()
+    _reset_cuda_peak("rollout_fwd")
+    rollout_features, rollout_log_probs = model.compute_rollout_data(
+        rollout_ids, rollout_masks, completion_start=context_len
+    )
+    _record_cuda_peak("rollout_fwd")
+
+    alignment, diversity = compute_feature_matching_terms_batched(
+        rollout_features, ref_features, num_rollouts
+    )
+    rewards = alignment - diversity  # (B * n,)
+
+    baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
+    advantages = (rewards - baselines).detach()  # stop-gradient on advantages
+
+    # REINFORCE: maximise E[advantage * log p]  ->  minimise negation
+    reinforce_loss = -(advantages * rollout_log_probs).mean()
+
+    # Mean reward / alignment / diversity across all rollouts (diagnostics)
+    mean_reward = rewards.detach().mean().item()
+    mean_alignment = alignment.detach().mean().item()
+    mean_diversity = diversity.detach().mean().item()
+    policy_nll = (-rollout_log_probs.detach().mean() / max(generation_length, 1)).item()
+
+    total_loss = reinforce_loss.item() + gamma * ce_loss_val
+
+    _reset_cuda_peak("backward")
+    reinforce_loss.backward()
     _record_cuda_peak("backward")
 
     result = {
@@ -524,7 +604,6 @@ def training_step(
         "mean_reward": mean_reward,
         "mean_alignment": mean_alignment,
         "mean_diversity": mean_diversity,
-        # Logged as "entropy"; computed as per-token NLL (lower bound on H(p))
         "entropy": policy_nll,
     }
     if cuda_mem:
@@ -539,6 +618,11 @@ def training_step(
 
 def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
+
+    # Optimization: Increase dynamo recompile limit to handle HF cache initialization
+    if hasattr(torch, "_dynamo"):
+        import torch._dynamo as dynamo
+        dynamo.config.recompile_limit = 32
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -609,15 +693,19 @@ def train(args: argparse.Namespace) -> None:
         print("Gradient checkpointing enabled on generator model")
 
     if args.compile_model and hasattr(torch, "compile"):
+        compile_mode = args.compile_mode
+        if compile_mode is None:
+            compile_mode = "default" if args.memory_constrained else "reduce-overhead"
+
         try:
             model.model = torch.compile(
                 model.model,
-                mode=args.compile_mode,
+                mode=compile_mode,
                 fullgraph=args.compile_fullgraph,
             )
             print(
                 "Enabled torch.compile for generator "
-                f"(mode={args.compile_mode}, fullgraph={args.compile_fullgraph})"
+                f"(mode={compile_mode}, fullgraph={args.compile_fullgraph})"
             )
         except Exception as exc:
             print(f"torch.compile unavailable for this setup; continuing without it: {exc}")
@@ -717,7 +805,12 @@ def train(args: argparse.Namespace) -> None:
     # before rollout tensors/activations are created. Alternative (often faster
     # when memory headroom exists): keep CE and REINFORCE in one combined loss
     # and call backward once.
-    use_memory_constrained_backward = True
+    if args.memory_constrained:
+        print("Using memory-constrained training step (early CE backward)")
+        step_fn = memory_constrained_training_step
+    else:
+        print("Using regular training step (single backward, CE/ref after rollouts)")
+        step_fn = training_step
 
     while step < args.max_steps:
         for batch in dataloader:
@@ -726,7 +819,7 @@ def train(args: argparse.Namespace) -> None:
 
             optimizer.zero_grad(set_to_none=True)
 
-            result = training_step(
+            result = step_fn(
                 model=model,
                 batch=batch,
                 num_rollouts=args.num_rollouts,
@@ -735,7 +828,6 @@ def train(args: argparse.Namespace) -> None:
                 temperature=args.temperature,
                 device=device,
                 log_cuda_memory=args.log_cuda_memory,
-                early_ce_backward=use_memory_constrained_backward,
             )
             torch.nn.utils.clip_grad_norm_(model.model.parameters(), args.grad_clip)
             if args.log_cuda_memory and device.type == "cuda":
@@ -755,9 +847,8 @@ def train(args: argparse.Namespace) -> None:
 
             step += 1
 
-            # Convert the loss tensor to a plain float now that backward() has
-            # been called; all other result values are already Python floats.
-            loss_val = result["loss"].item()
+            # Loss is already stored as a detached scalar for logging.
+            loss_val = result["loss"]
 
             # Record metrics for every step (floats only, very lightweight)
             metrics_history.append(
@@ -790,7 +881,6 @@ def train(args: argparse.Namespace) -> None:
                         f"ref={mem.get('ref_alloc_mb', 0.0):.0f}/{mem.get('ref_reserved_mb', 0.0):.0f} "
                         f"gen={mem.get('gen_alloc_mb', 0.0):.0f}/{mem.get('gen_reserved_mb', 0.0):.0f} "
                         f"rollout_fwd={mem.get('rollout_fwd_alloc_mb', 0.0):.0f}/{mem.get('rollout_fwd_reserved_mb', 0.0):.0f} "
-                        f"ce_fwd={mem.get('ce_fwd_alloc_mb', 0.0):.0f}/{mem.get('ce_fwd_reserved_mb', 0.0):.0f} "
                         f"backward={mem.get('backward_alloc_mb', 0.0):.0f}/{mem.get('backward_reserved_mb', 0.0):.0f} "
                         f"opt={mem.get('opt_step_alloc_mb', 0.0):.0f}/{mem.get('opt_step_reserved_mb', 0.0):.0f}"
                     )

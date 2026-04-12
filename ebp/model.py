@@ -357,6 +357,40 @@ class EMAEBPModel(nn.Module):
             outputs.logits, input_ids, attention_mask, completion_start
         )
 
+    def forward_ce_and_ref_features(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        completion_start: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return CE loss and detached reference features for EMA variant.
+
+        For :class:`EMAEBPModel`, this intentionally remains a two-forward
+        implementation: CE is computed on the trainable generator while
+        reference features are computed via ``ema_model``.
+
+        Args:
+            input_ids: ``(B, L)`` full sequence (context + completion).
+            attention_mask: ``(B, L)`` binary mask.
+            completion_start: Index of first completion token.
+
+        Returns:
+            ce_loss: Scalar CE loss tensor with gradients.
+            ref_features: ``(B, D * K)`` detached EMA reference features.
+        """
+        ce_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=input_ids,
+            use_cache=False,
+        ).loss
+        ref_features = self.extract_features(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            completion_start=completion_start,
+        )
+        return ce_loss, ref_features
+
     # ------------------------------------------------------------------
     # Combined rollout data (features from EMA + log probs from generator)
     # ------------------------------------------------------------------
