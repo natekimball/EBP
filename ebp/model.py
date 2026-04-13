@@ -47,29 +47,46 @@ def _pool_hidden_state(
     h: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
     completion_start: Optional[int],
+    pool_type: str = "last",
 ) -> torch.Tensor:
-    """Mean-pool hidden states and L2-normalise.
+    """Pool hidden states and L2-normalise.
 
     Args:
         h: ``(B, L, D)`` hidden state tensor.
         attention_mask: ``(B, L)`` binary mask (1 = real token).
         completion_start: If given, pool only over ``[completion_start, L)``.
+        pool_type: Pooling strategy: "last" (default) or "mean".
 
     Returns:
         ``(B, D)`` L2-normalised pooled vector.
     """
-    if completion_start is not None:
-        comp_h = h[:, completion_start:, :]  # (B, comp_len, D)
-        if attention_mask is not None:
-            mask = attention_mask[:, completion_start:].float().unsqueeze(-1)
-            pooled = (comp_h * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
+    if pool_type == "mean":
+        if completion_start is not None:
+            comp_h = h[:, completion_start:, :]  # (B, comp_len, D)
+            if attention_mask is not None:
+                mask = attention_mask[:, completion_start:].float().unsqueeze(-1)
+                pooled = (comp_h * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
+            else:
+                pooled = comp_h.mean(dim=1)
+        elif attention_mask is not None:
+            mask = attention_mask.float().unsqueeze(-1)
+            pooled = (h * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
         else:
-            pooled = comp_h.mean(dim=1)
-    elif attention_mask is not None:
-        mask = attention_mask.float().unsqueeze(-1)
-        pooled = (h * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
+            pooled = h.mean(dim=1)
     else:
-        pooled = h[:, -1, :]  # Fallback: last token
+        # Default: last-token pooling
+        if attention_mask is not None:
+            # Get index of the last non-masked token for each sequence
+            # (B, L) -> (B,)
+            last_indices = attention_mask.sum(dim=1).long() - 1
+            # B-sized range: [0, 1, ..., B-1]
+            batch_range = torch.arange(h.size(0), device=h.device)
+            # Gather (B, D)
+            pooled = h[batch_range, last_indices]
+        else:
+            # Fallback: physical last token
+            pooled = h[:, -1, :]
+
     return F.normalize(pooled, p=2, dim=-1)
 
 
@@ -189,6 +206,7 @@ def _features_from_hidden_states(
     attention_mask: Optional[torch.Tensor],
     completion_start: Optional[int],
     detach: bool,
+    pool_type: str = "last",
 ) -> torch.Tensor:
     """Build concatenated pooled features from model hidden states.
 
@@ -201,7 +219,7 @@ def _features_from_hidden_states(
         h = hidden_states[idx + 1]
         if detach:
             h = h.detach()
-        blocks.append(_pool_hidden_state(h, attention_mask, completion_start))
+        blocks.append(_pool_hidden_state(h, attention_mask, completion_start, pool_type=pool_type))
     return torch.cat(blocks, dim=-1)
 
 
@@ -221,9 +239,9 @@ class EMAEBPModel(nn.Module):
       gradient step; no gradient ever flows through it.
 
     Feature extraction follows the EBFT paper: hidden states at layers placed
-    at depths ``feature_layer_fractions`` of the network are mean-pooled over
-    the completion token positions, then L2-normalised per layer, and finally
-    concatenated into a single feature vector.
+    at depths ``feature_layer_fractions`` of the network are pooled (last-token
+    or mean), then L2-normalised per layer, and finally concatenated into a
+    single feature vector.
 
     Rollout generation uses a **prefix KV cache**: the KV cache is computed
     once for each batch item's context and reused across all ``num_rollouts``
@@ -234,6 +252,8 @@ class EMAEBPModel(nn.Module):
         ema_decay: EMA decay factor (``ema <- decay*ema + (1-decay)*theta``).
         feature_layer_fractions: Relative depths at which to capture hidden
             states, e.g. ``(0.25, 0.50, 0.75)``.
+        pool_type: Pooling strategy for hidden-state features (default: ``"last"``,
+            or ``"mean"``).
         model: Optional pre-instantiated model; if supplied, *model_name* is
             ignored.
     """
@@ -243,6 +263,7 @@ class EMAEBPModel(nn.Module):
         model_name: str = "Qwen/Qwen3-0.6B",
         ema_decay: float = 0.999,
         feature_layer_fractions: Sequence[float] = (0.25, 0.50, 0.75),
+        pool_type: str = "last",
         model: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
@@ -259,6 +280,7 @@ class EMAEBPModel(nn.Module):
 
         self.ema_decay = ema_decay
         self.feature_layer_fractions = tuple(feature_layer_fractions)
+        self.pool_type = pool_type
 
         num_layers = len(_get_transformer_layers(self.model))
         self.feature_layer_indices: List[int] = [
@@ -325,6 +347,7 @@ class EMAEBPModel(nn.Module):
             attention_mask=attention_mask,
             completion_start=completion_start,
             detach=True,
+            pool_type=self.pool_type,
         )  # (B, D * K)
 
     # ------------------------------------------------------------------
@@ -506,6 +529,8 @@ class OnlineEBPModel(nn.Module):
         model_name: HuggingFace model identifier (default: ``"Qwen/Qwen3-0.6B"``).
         feature_layer_fractions: Relative depths at which to capture hidden
             states.
+        pool_type: Pooling strategy for hidden-state features (default: ``"last"``,
+            or ``"mean"``).
         model: Optional pre-instantiated model; if supplied, *model_name* is
             ignored.
     """
@@ -514,6 +539,7 @@ class OnlineEBPModel(nn.Module):
         self,
         model_name: str = "Qwen/Qwen3-0.6B",
         feature_layer_fractions: Sequence[float] = (0.25, 0.50, 0.75),
+        pool_type: str = "last",
         model: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
@@ -524,6 +550,7 @@ class OnlineEBPModel(nn.Module):
             self.model = AutoModelForCausalLM.from_pretrained(model_name)
 
         self.feature_layer_fractions = tuple(feature_layer_fractions)
+        self.pool_type = pool_type
 
         num_layers = len(_get_transformer_layers(self.model))
         self.feature_layer_indices: List[int] = [
@@ -591,6 +618,7 @@ class OnlineEBPModel(nn.Module):
             attention_mask=attention_mask,
             completion_start=completion_start,
             detach=True,
+            pool_type=self.pool_type,
         )
 
     # ------------------------------------------------------------------
@@ -636,6 +664,7 @@ class OnlineEBPModel(nn.Module):
             attention_mask=attention_mask,
             completion_start=completion_start,
             detach=True,
+            pool_type=self.pool_type,
         )  # (B, D * K), detached
 
         log_probs = _sum_completion_log_probs(
@@ -679,6 +708,7 @@ class OnlineEBPModel(nn.Module):
             attention_mask=attention_mask,
             completion_start=completion_start,
             detach=True,
+            pool_type=self.pool_type,
         )
         return outputs.loss, ref_features
 
