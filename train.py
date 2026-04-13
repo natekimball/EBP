@@ -75,7 +75,7 @@ import argparse
 import os
 import pickle
 from functools import partial
-from typing import List, Union
+from typing import Iterator, List, Union
 
 import torch
 from torch.utils.data import DataLoader
@@ -84,6 +84,73 @@ from transformers import AutoTokenizer
 from ebp.data import PretrainingDataset, collate_fn
 from ebp.model import EMAEBPModel, OnlineEBPModel
 from ebp.rewards import compute_feature_matching_terms_batched, compute_rloo_baseline_batched
+
+
+# ---------------------------------------------------------------------------
+# GPU Prefetcher for asynchronous data movement
+# ---------------------------------------------------------------------------
+
+
+class GPUPrefetcher:
+    """Overlaps CPU->GPU data transfer with model training.
+
+    Fetches batch i+1 while batch i is being processed, reducing GPU idle time.
+    Uses non-blocking transfers to pipeline data movement with computation.
+    """
+
+    def __init__(self, dataloader: DataLoader, device: torch.device):
+        """Initialize prefetcher.
+
+        Args:
+            dataloader: PyTorch DataLoader to prefetch from.
+            device: Target device (GPU).
+        """
+        self.dataloader = dataloader
+        self.device = device
+        self.stream = torch.cuda.Stream() if device.type == "cuda" else None
+
+    def __iter__(self) -> Iterator[dict]:
+        """Yield batches with prefetching."""
+        dataloader_iter = iter(self.dataloader)
+
+        # Fetch first batch in background
+        try:
+            batch = next(dataloader_iter)
+        except StopIteration:
+            return
+
+        if self.device.type == "cuda":
+            # Pre-load first batch in prefetch stream
+            with torch.cuda.stream(self.stream):
+                batch = self._move_to_device_async(batch)
+
+        for next_batch in dataloader_iter:
+            # Synchronize prefetch stream if on GPU (ensures batch is ready)
+            if self.device.type == "cuda":
+                self.stream.synchronize()
+
+            yield batch
+
+            # Prefetch next batch in background while current batch trains
+            if self.device.type == "cuda":
+                with torch.cuda.stream(self.stream):
+                    batch = self._move_to_device_async(next_batch)
+            else:
+                batch = self._move_to_device(next_batch)
+
+        # Final batch synchronization
+        if self.device.type == "cuda":
+            self.stream.synchronize()
+        yield batch
+
+    def _move_to_device_async(self, batch: dict) -> dict:
+        """Move batch to device asynchronously (in prefetch stream)."""
+        return {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+
+    def _move_to_device(self, batch: dict) -> dict:
+        """Move batch to device synchronously (CPU only)."""
+        return {k: v.to(self.device, non_blocking=False) for k, v in batch.items()}
+
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +432,7 @@ def training_step(
 
     Args:
         model: Either :class:`EMAEBPModel` or :class:`OnlineEBPModel`.
-        batch: Dict of tensors from :func:`ebp.data.collate_fn`.
+        batch: Dict of tensors from :func:`ebp.data.collate_fn` (already on device).
         num_rollouts: Number of completions to generate per context.
         generation_length: Number of tokens to generate.
         gamma: Weight of the cross-entropy term (0 -> feature-matching only).
@@ -377,11 +444,11 @@ def training_step(
         ``mean_reward``, and ``entropy`` (mean per-token negative log-prob of
         rollout sequences, a proxy for the policy entropy).
     """
-    non_blocking = device.type == "cuda"
-    context_ids = batch["context_ids"].to(device, non_blocking=non_blocking)
-    context_mask = batch["context_mask"].to(device, non_blocking=non_blocking)
-    completion_ids = batch["completion_ids"].to(device, non_blocking=non_blocking)
-    completion_mask = batch["completion_mask"].to(device, non_blocking=non_blocking)
+    # Batch is already on device via GPUPrefetcher, no need for explicit transfer
+    context_ids = batch["context_ids"]
+    context_mask = batch["context_mask"]
+    completion_ids = batch["completion_ids"]
+    completion_mask = batch["completion_mask"]
 
     batch_size = context_ids.shape[0]
     context_len = context_ids.shape[1]
@@ -514,11 +581,11 @@ def memory_constrained_training_step(
     This path reduces peak VRAM by backpropagating the CE term before rollout
     tensors/activations are created.
     """
-    non_blocking = device.type == "cuda"
-    context_ids = batch["context_ids"].to(device, non_blocking=non_blocking)
-    context_mask = batch["context_mask"].to(device, non_blocking=non_blocking)
-    completion_ids = batch["completion_ids"].to(device, non_blocking=non_blocking)
-    completion_mask = batch["completion_mask"].to(device, non_blocking=non_blocking)
+    # Batch is already on device via GPUPrefetcher, no need for explicit transfer
+    context_ids = batch["context_ids"]
+    context_mask = batch["context_mask"]
+    completion_ids = batch["completion_ids"]
+    completion_mask = batch["completion_mask"]
 
     context_len = context_ids.shape[1]
     cuda_mem = {}
@@ -812,8 +879,11 @@ def train(args: argparse.Namespace) -> None:
         print("Using regular training step (single backward, CE/ref after rollouts)")
         step_fn = training_step
 
+    # Wrap dataloader with GPU prefetcher for asynchronous H2D transfer
+    prefetched_loader = GPUPrefetcher(dataloader, device)
+
     while step < args.max_steps:
-        for batch in dataloader:
+        for batch in prefetched_loader:
             if step >= args.max_steps:
                 break
 
