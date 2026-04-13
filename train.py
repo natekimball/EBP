@@ -83,7 +83,11 @@ from transformers import AutoTokenizer
 
 from ebp.data import PretrainingDataset, collate_fn
 from ebp.model import EMAEBPModel, OnlineEBPModel
-from ebp.rewards import compute_feature_matching_terms_batched, compute_rloo_baseline_batched
+from ebp.rewards import (
+    compute_feature_matching_terms_batched,
+    compute_rloo_baseline_batched,
+    compute_whitened_feature_matching_terms_batched,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +253,19 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Sampling temperature for rollout generation.",
+    )
+    parser.add_argument(
+        "--whitening",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to use whitened feature matching (Eq. 9 of the EBFT paper).",
+    )
+    parser.add_argument(
+        "--pool_type",
+        type=str,
+        default="last",
+        choices=["last", "mean"],
+        help="Pooling strategy for hidden-state features.",
     )
     # Optimiser
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -422,6 +439,7 @@ def training_step(
     temperature: float,
     device: torch.device,
     log_cuda_memory: bool = False,
+    whitening: bool = True,
 ) -> dict:
     """Regular EBP training step with a single backward pass.
 
@@ -518,9 +536,14 @@ def training_step(
     # ------------------------------------------------------------------
     # 5. Feature-matching rewards and REINFORCE loss
     # ------------------------------------------------------------------
-    alignment, diversity = compute_feature_matching_terms_batched(
-        rollout_features, ref_features, num_rollouts
-    )
+    if whitening:
+        alignment, diversity = compute_whitened_feature_matching_terms_batched(
+            rollout_features, ref_features, num_rollouts
+        )
+    else:
+        alignment, diversity = compute_feature_matching_terms_batched(
+            rollout_features, ref_features, num_rollouts
+        )
     rewards = alignment - diversity  # (B * n,)
 
     baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
@@ -575,6 +598,7 @@ def memory_constrained_training_step(
     temperature: float,
     device: torch.device,
     log_cuda_memory: bool = False,
+    whitening: bool = True,
 ) -> dict:
     """Memory-constrained EBP step with early CE backward.
 
@@ -641,9 +665,14 @@ def memory_constrained_training_step(
     )
     _record_cuda_peak("rollout_fwd")
 
-    alignment, diversity = compute_feature_matching_terms_batched(
-        rollout_features, ref_features, num_rollouts
-    )
+    if whitening:
+        alignment, diversity = compute_whitened_feature_matching_terms_batched(
+            rollout_features, ref_features, num_rollouts
+        )
+    else:
+        alignment, diversity = compute_feature_matching_terms_batched(
+            rollout_features, ref_features, num_rollouts
+        )
     rewards = alignment - diversity  # (B * n,)
 
     baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
@@ -748,12 +777,13 @@ def train(args: argparse.Namespace) -> None:
             raise
 
     if args.model_type == "ema":
-        model: Union[EMAEBPModel, OnlineEBPModel] = EMAEBPModel(
+        model = EMAEBPModel(
             model=base_model,
             ema_decay=args.ema_decay,
+            pool_type=args.pool_type,
         )
     else:
-        model = OnlineEBPModel(model=base_model)
+        model = OnlineEBPModel(model=base_model, pool_type=args.pool_type)
 
     if args.gradient_checkpointing:
         model.model.gradient_checkpointing_enable()
@@ -898,6 +928,7 @@ def train(args: argparse.Namespace) -> None:
                 temperature=args.temperature,
                 device=device,
                 log_cuda_memory=args.log_cuda_memory,
+                whitening=args.whitening,
             )
             torch.nn.utils.clip_grad_norm_(model.model.parameters(), args.grad_clip)
             if args.log_cuda_memory and device.type == "cuda":

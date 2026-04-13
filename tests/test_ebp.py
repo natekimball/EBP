@@ -109,10 +109,12 @@ class TestEMAExtractFeatures(unittest.TestCase):
         features = self.ebp.extract_features(self.ids, self.mask)
         self.assertFalse(features.requires_grad)
 
-    def test_completion_start_changes_features(self):
+    def test_completion_start_no_effect_last_token(self):
+        """With last-token pooling, completion_start has no effect since the
+        last token remains the same."""
         f_full = self.ebp.extract_features(self.ids, self.mask)
         f_comp = self.ebp.extract_features(self.ids, self.mask, completion_start=6)
-        self.assertFalse(torch.allclose(f_full, f_comp))
+        self.assertTrue(torch.allclose(f_full, f_comp))
 
 
 class TestEMAComputeLogProbs(unittest.TestCase):
