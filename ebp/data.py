@@ -10,10 +10,10 @@ cross-entropy term.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset, get_worker_info
 from transformers import PreTrainedTokenizerBase
 
 
@@ -28,7 +28,7 @@ def load_dataset(*args, **kwargs):
     return _load(*args, **kwargs)
 
 
-class PretrainingDataset(Dataset):
+class PretrainingDataset(IterableDataset):
     """Sliding-window text dataset for EBP pretraining.
 
     Loads a HuggingFace ``datasets`` dataset, tokenises all documents, and
@@ -52,7 +52,6 @@ class PretrainingDataset(Dataset):
             be included.
         text_column: Name of the text column in the dataset.
         streaming: Whether to stream documents from the dataset backend.
-        max_documents: Optional cap on number of documents to tokenise.
         max_tokens: Optional cap on total concatenated tokens before chunking.
         max_examples: Optional cap on number of produced training chunks.
     """
@@ -74,56 +73,75 @@ class PretrainingDataset(Dataset):
         max_examples: Optional[int] = None,
         skip_documents: int = 0,
     ) -> None:
+        self.tokenizer = tokenizer
+        self.dataset_name = dataset_name
+        self.dataset_config = dataset_config
+        self.split = split
         self.context_length = context_length
         self.completion_length = completion_length
-        chunk_size = context_length + completion_length
-        stride = stride if stride is not None else chunk_size
+        self.chunk_size = context_length + completion_length
+        self.stride = stride if stride is not None else self.chunk_size
+        self.min_doc_chars = min_doc_chars
+        self.text_column = text_column
+        self.streaming = streaming
+        self.max_documents = max_documents
+        self.max_tokens = max_tokens
+        self.max_examples = max_examples
+        self.skip_documents = skip_documents
+
+    def __iter__(self) -> Iterator[Dict[str, List[int]]]:
+        worker_info = get_worker_info()
 
         raw = load_dataset(
-            dataset_name,
-            dataset_config,
-            split=split,
+            self.dataset_name,
+            self.dataset_config,
+            split=self.split,
             trust_remote_code=True,
-            streaming=streaming,
+            streaming=self.streaming,
         )
 
-        # EOS token used as a document separator so that no chunk spans
-        # two documents.  When eos_token_id is None (rare) we skip separators.
-        eos_id: Optional[int] = tokenizer.eos_token_id
+        # Multi-worker sharding
+        if worker_info is not None:
+            try:
+                # HuggingFace streaming datasets often support .shard()
+                raw = raw.shard(num_shards=worker_info.num_workers, index=worker_info.id)
+            except Exception:
+                # Fallback: simple modulo skip if .shard() isn't supported or fails
+                import itertools
 
-        # Stream documents and incrementally build chunks so startup does not
-        # require tokenising the entire corpus before creating examples.
+                raw = itertools.islice(raw, worker_info.id, None, worker_info.num_workers)
+
+        eos_id: Optional[int] = self.tokenizer.eos_token_id
+
         token_buffer: List[int] = []
         buffer_start = 0
         accepted_docs = 0
         total_tokens = 0
-        have_previous_doc = False
+        examples_yielded = 0
         docs_skipped = 0
-        self.examples: List[List[int]] = []
+        have_previous_doc = False
 
         for item in raw:
-            if docs_skipped < skip_documents:
+            if docs_skipped < self.skip_documents:
                 docs_skipped += 1
                 continue
 
-            if max_documents is not None and accepted_docs >= max_documents:
+            if self.max_documents is not None and accepted_docs >= self.max_documents:
                 break
-            if max_tokens is not None and total_tokens >= max_tokens:
-                break
-            if max_examples is not None and len(self.examples) >= max_examples:
+            if self.max_tokens is not None and total_tokens >= self.max_tokens:
                 break
 
-            text = item[text_column]
-            if len(text.strip()) < min_doc_chars:
+            text = item[self.text_column]
+            if len(text.strip()) < self.min_doc_chars:
                 continue
 
-            tokens = tokenizer.encode(text, add_special_tokens=False)
+            tokens = self.tokenizer.encode(text, add_special_tokens=False)
             doc_tokens: List[int] = tokens
             if have_previous_doc and eos_id is not None:
                 doc_tokens = [eos_id] + doc_tokens
 
-            if max_tokens is not None:
-                remaining = max_tokens - total_tokens
+            if self.max_tokens is not None:
+                remaining = self.max_tokens - total_tokens
                 if remaining <= 0:
                     break
                 doc_tokens = doc_tokens[:remaining]
@@ -136,34 +154,25 @@ class PretrainingDataset(Dataset):
             accepted_docs += 1
             have_previous_doc = True
 
-            while len(token_buffer) - buffer_start >= chunk_size:
-                end = buffer_start + chunk_size
-                self.examples.append(token_buffer[buffer_start:end])
+            while len(token_buffer) - buffer_start >= self.chunk_size:
+                end = buffer_start + self.chunk_size
+                tokens_out = token_buffer[buffer_start:end]
 
-                if max_examples is not None and len(self.examples) >= max_examples:
-                    break
+                yield {
+                    "context_ids": tokens_out[: self.context_length],
+                    "completion_ids": tokens_out[self.context_length :],
+                }
 
-                buffer_start += stride
+                examples_yielded += 1
+                if self.max_examples is not None and examples_yielded >= self.max_examples:
+                    return
 
-            if max_examples is not None and len(self.examples) >= max_examples:
-                break
+                buffer_start += self.stride
 
             # Periodically trim consumed prefix to keep memory bounded.
             if buffer_start > 4096:
                 token_buffer = token_buffer[buffer_start:]
                 buffer_start = 0
-
-    # ------------------------------------------------------------------
-
-    def __len__(self) -> int:
-        return len(self.examples)
-
-    def __getitem__(self, idx: int) -> Dict[str, List[int]]:
-        tokens = self.examples[idx]
-        return {
-            "context_ids": tokens[: self.context_length],
-            "completion_ids": tokens[self.context_length :],
-        }
 
 
 def collate_fn(

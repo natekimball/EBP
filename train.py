@@ -209,12 +209,6 @@ def parse_args() -> argparse.Namespace:
         help="Stream dataset samples instead of loading split materialization upfront.",
     )
     parser.add_argument(
-        "--max_documents",
-        type=int,
-        default=None,
-        help="Optional cap on number of raw documents tokenised from the dataset.",
-    )
-    parser.add_argument(
         "--max_tokens",
         type=int,
         default=None,
@@ -962,12 +956,11 @@ def train(args: argparse.Namespace) -> None:
         context_length=args.context_length,
         completion_length=args.generation_length,
         streaming=args.streaming,
-        max_documents=args.max_documents,
         max_tokens=args.max_tokens,
         max_examples=args.max_examples,
         skip_documents=val_skip_docs,
     )
-    print(f"Train dataset size: {len(dataset)} examples")
+    print("Train dataset loaded in streaming mode")
 
     val_dataloader = None
     if args.val_split:
@@ -982,7 +975,7 @@ def train(args: argparse.Namespace) -> None:
                 completion_length=args.generation_length,
                 streaming=args.streaming,
                 max_documents=val_skip_docs,
-                skip_documents=0,
+                max_examples=args.max_val_batches * val_bs,
             )
         else:
             print(f"Loading validation dataset split: {args.val_split} ...")
@@ -997,7 +990,7 @@ def train(args: argparse.Namespace) -> None:
                 # Use a small subset for validation to avoid long pauses
                 max_examples=args.max_val_batches * val_bs,
             )
-        print(f"Validation dataset size: {len(val_dataset)} examples")
+        print("Validation dataset loaded in streaming mode")
         print(f"Validation batch size: {val_bs}")
         
         val_dataloader = DataLoader(
@@ -1034,7 +1027,7 @@ def train(args: argparse.Namespace) -> None:
     dataloader_kwargs = {
         "dataset": dataset,
         "batch_size": args.batch_size,
-        "shuffle": True,
+        "shuffle": False,  # IterableDataset handles shuffling internal to the stream
         "collate_fn": partial(collate_fn, pad_token_id=pad_id),
         "drop_last": True,
         "pin_memory": pin_memory,
@@ -1201,7 +1194,7 @@ def train(args: argparse.Namespace) -> None:
                     # Store validation metrics with a prefix
                     val_metrics = {f"val_{k}": v for k, v in val_res.items()}
                     metrics_history[-1].update(val_metrics)
-
+                
             if step % args.save_steps == 0:
                 save_path = os.path.join(args.output_dir, f"step_{step}")
                 model.model.save_pretrained(save_path)
