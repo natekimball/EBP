@@ -107,13 +107,13 @@ def main() -> None:
 
     history = load_history(args.metrics_file)
 
-    # All metrics to plot: (key, y-axis label, subplot title)
+    # All metrics to plot: (key, y-axis label, subplot title, include_val)
     panels = [
-        ("loss",           "Loss",        "Total Loss"),
-        ("reinforce_loss", "Loss",        "REINFORCE Loss"),
-        ("ce_loss",        "Loss",        "Cross-Entropy Loss"),
-        ("mean_reward",    "Reward",      "Mean Feature-Matching Reward"),
-        ("entropy",        "Entropy/NLL", "Entropy Proxy (per-token NLL)"),
+        ("loss",           "Loss",        "Total Loss",                 True),
+        ("reinforce_loss", "Loss",        "REINFORCE Loss",             True),
+        ("ce_loss",        "Loss",        "Cross-Entropy Loss",         True),
+        ("mean_reward",    "Reward",      "Mean Feature-Matching Reward", True),
+        ("entropy",        "Entropy/NLL", "Entropy Proxy (per-token NLL)", True),
     ]
 
     # Determine EMA alpha from the requested window size.
@@ -127,43 +127,56 @@ def main() -> None:
     ncols = 3
     nrows = -(-len(panels) // ncols)  # ceiling division
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
-    axes_flat = axes.flatten()
+    if nrows == 1 and ncols == 1:
+        axes_flat = [axes]
+    else:
+        axes_flat = axes.flatten()
 
-    for ax, (key, ylabel, title) in zip(axes_flat, panels):
-        missing_steps = [m["step"] for m in history if key not in m]
-        if missing_steps:
-            import warnings
-            warnings.warn(
-                f"Metric '{key}' is missing from {len(missing_steps)} record(s) "
-                f"(steps {missing_steps[:5]}{'...' if len(missing_steps) > 5 else ''}). "
-                "Those steps will be skipped.",
-                stacklevel=2,
-            )
-        valid = [(m["step"], m[key]) for m in history if key in m]
-        if not valid:
+    for ax, (key, ylabel, title, include_val) in zip(axes_flat, panels):
+        # 1. Plot train data
+        valid_train = [(m["step"], m[key]) for m in history if key in m]
+        if not valid_train:
             ax.set_title(f"{title}\n(no data)", fontsize=11)
             ax.set_visible(True)
             continue
-        plot_steps, values = zip(*valid)
+        train_steps, train_values = zip(*valid_train)
+
+        color_train = "tab:blue"
+        color_val = "tab:orange"
 
         if alpha > 0.0:
-            # Plot raw values as a faint background
-            ax.plot(plot_steps, values, color="tab:blue", alpha=0.2, linewidth=0.8)
-            smoothed = ema_smooth(list(values), alpha)
+            # Plot raw train values as a faint background
+            ax.plot(train_steps, train_values, color=color_train, alpha=0.15, linewidth=0.6)
+            smoothed = ema_smooth(list(train_values), alpha)
             ax.plot(
-                plot_steps, smoothed,
-                color="tab:blue", linewidth=1.5,
-                label=f"EMA (α={alpha:.3f})",
+                train_steps, smoothed,
+                color=color_train, linewidth=1.5,
+                label="Train (EMA)",
             )
-            ax.legend(fontsize=8)
         else:
-            ax.plot(plot_steps, values, color="tab:blue", linewidth=1.0)
+            ax.plot(train_steps, train_values, color=color_train, linewidth=1.0, label="Train")
+
+        # 2. Plot validation data (if present and requested)
+        val_key = f"val_{key}"
+        valid_val = [(m["step"], m[val_key]) for m in history if val_key in m]
+        if include_val and valid_val:
+            val_steps, val_values = zip(*valid_val)
+            # Validation is usually sparse, so we use markers + lines
+            ax.plot(
+                val_steps, val_values,
+                color=color_val, marker="o", markersize=4,
+                linewidth=1.2, label="Val",
+            )
 
         ax.set_title(title, fontsize=11)
         ax.set_xlabel("Step", fontsize=9)
         ax.set_ylabel(ylabel, fontsize=9)
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.tick_params(labelsize=8)
+        
+        # Only show legend if we have two types of data or if smoothing is on
+        if (include_val and valid_val) or alpha > 0.0:
+            ax.legend(fontsize=8)
 
     # Hide any unused subplot panels
     for ax in axes_flat[len(panels):]:

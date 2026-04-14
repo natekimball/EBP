@@ -72,6 +72,7 @@ class PretrainingDataset(Dataset):
         max_documents: Optional[int] = None,
         max_tokens: Optional[int] = None,
         max_examples: Optional[int] = None,
+        skip_documents: int = 0,
     ) -> None:
         self.context_length = context_length
         self.completion_length = completion_length
@@ -97,9 +98,14 @@ class PretrainingDataset(Dataset):
         accepted_docs = 0
         total_tokens = 0
         have_previous_doc = False
+        docs_skipped = 0
         self.examples: List[List[int]] = []
 
         for item in raw:
+            if docs_skipped < skip_documents:
+                docs_skipped += 1
+                continue
+
             if max_documents is not None and accepted_docs >= max_documents:
                 break
             if max_tokens is not None and total_tokens >= max_tokens:

@@ -193,6 +193,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_config", type=str, default="v1_7")
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument(
+        "--val_split",
+        type=str,
+        default=None,
+        help=(
+            "Dataset split for validation (e.g. 'validation'). If None, no "
+            "validation is performed. If set to the same as --dataset_split, "
+            "a validation set is automatically carved out from the start."
+        ),
+    )
+    parser.add_argument(
         "--streaming",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -215,6 +225,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional cap on number of fixed-length training examples to build.",
+    )
+    parser.add_argument(
+        "--val_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for validation. Defaults to 2x train batch_size if not specified.",
+    )
+    parser.add_argument(
+        "--max_val_docs",
+        type=int,
+        default=500,
+        help="Number of documents to use for validation when carving out from training split.",
     )
     # Sequence lengths
     parser.add_argument(
@@ -277,7 +299,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_steps", type=int, default=10_000)
     parser.add_argument("--log_steps", type=int, default=100)
-    parser.add_argument("--save_steps", type=int, default=1_000)
+    parser.add_argument(
+        "--val_steps",
+        type=int,
+        default=2_000,
+        help="Interval for validation steps.",
+    )
+    parser.add_argument(
+        "--max_val_batches",
+        type=int,
+        default=100,
+        help="Number of batches to evaluate during validation.",
+    )
+    parser.add_argument("--save_steps", type=int, default=10_000)
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument(
         "--metrics_file",
@@ -589,6 +623,109 @@ def training_step(
     return result
 
 
+@torch.no_grad()
+def validation_epoch(
+    model: Union[EMAEBPModel, OnlineEBPModel],
+    dataloader: DataLoader,
+    num_rollouts: int,
+    generation_length: int,
+    gamma: float,
+    temperature: float,
+    device: torch.device,
+    max_batches: int = 50,
+    whitening: bool = True,
+) -> dict:
+    """Computes mean metrics over validation batches.
+
+    This function sets the model to eval() mode and iterates through the
+    provided dataloader for a fixed number of batches, computing the same
+    metrics as training_step but without gradient updates or backpropagation.
+    """
+    model.eval()
+    all_results = []
+
+    count = 0
+    for batch in dataloader:
+        if count >= max_batches:
+            break
+
+        # Move batch to device
+        batch_device = {k: v.to(device, non_blocking=False) for k, v in batch.items()}
+
+        context_ids = batch_device["context_ids"]
+        context_mask = batch_device["context_mask"]
+        completion_ids = batch_device["completion_ids"]
+        completion_mask = batch_device["completion_mask"]
+        context_len = context_ids.shape[1]
+
+        full_ids = torch.cat([context_ids, completion_ids], dim=1)
+        full_mask = torch.cat([context_mask, completion_mask], dim=1)
+
+        # 1. Generate rollouts
+        rollout_ids, rollout_masks = model.generate_rollouts(
+            context_ids=context_ids,
+            context_attention_mask=context_mask,
+            num_rollouts=num_rollouts,
+            generation_length=generation_length,
+            temperature=temperature,
+        )
+
+        # 2. Rollout features + log-probs
+        rollout_features, rollout_log_probs = model.compute_rollout_data(
+            rollout_ids, rollout_masks, completion_start=context_len
+        )
+
+        # 3. Reference features and CE
+        ce_loss, ref_features = model.forward_ce_and_ref_features(
+            full_ids,
+            full_mask,
+            completion_start=context_len,
+        )
+
+        # 4. Feature-matching rewards
+        if whitening:
+            alignment, diversity = compute_whitened_feature_matching_terms_batched(
+                rollout_features, ref_features, num_rollouts
+            )
+        else:
+            alignment, diversity = compute_feature_matching_terms_batched(
+                rollout_features, ref_features, num_rollouts
+            )
+        rewards = alignment - diversity
+
+        baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
+        advantages = (rewards - baselines)
+        reinforce_loss = -(advantages * rollout_log_probs).mean()
+
+        total_loss = reinforce_loss
+        if gamma > 0.0:
+            total_loss = total_loss + gamma * ce_loss
+
+        policy_nll = (-rollout_log_probs.mean() / max(generation_length, 1)).item()
+
+        result = {
+            "loss": total_loss.item(),
+            "reinforce_loss": reinforce_loss.item(),
+            "ce_loss": ce_loss.item(),
+            "mean_reward": rewards.mean().item(),
+            "mean_alignment": alignment.mean().item(),
+            "mean_diversity": diversity.mean().item(),
+            "entropy": policy_nll,
+        }
+        all_results.append(result)
+        count += 1
+
+    if not all_results:
+        return {}
+
+    # Aggregate results
+    avg_res = {
+        k: sum(r[k] for r in all_results) / len(all_results)
+        for k in all_results[0].keys()
+    }
+    return avg_res
+
+
 def memory_constrained_training_step(
     model: Union[EMAEBPModel, OnlineEBPModel],
     batch: dict,
@@ -810,6 +947,12 @@ def train(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Dataset
     # ------------------------------------------------------------------
+    val_bs = args.val_batch_size if args.val_batch_size is not None else args.batch_size * 2
+    val_skip_docs = 0
+    if args.val_split == args.dataset_split:
+        val_skip_docs = args.max_val_docs
+        print(f"Carving out {val_skip_docs} documents from {args.dataset_split} split for validation")
+
     print(f"Loading dataset: {args.dataset_name}/{args.dataset_config} ...")
     dataset = PretrainingDataset(
         tokenizer=tokenizer,
@@ -822,9 +965,56 @@ def train(args: argparse.Namespace) -> None:
         max_documents=args.max_documents,
         max_tokens=args.max_tokens,
         max_examples=args.max_examples,
+        skip_documents=val_skip_docs,
     )
-    print(f"Dataset size: {len(dataset)} examples")
+    print(f"Train dataset size: {len(dataset)} examples")
 
+    val_dataloader = None
+    if args.val_split:
+        if val_skip_docs > 0:
+            print(f"Creating validation set from first {val_skip_docs} documents of {args.dataset_split} split...")
+            val_dataset = PretrainingDataset(
+                tokenizer=tokenizer,
+                dataset_name=args.dataset_name,
+                dataset_config=args.dataset_config,
+                split=args.dataset_split,
+                context_length=args.context_length,
+                completion_length=args.generation_length,
+                streaming=args.streaming,
+                max_documents=val_skip_docs,
+                skip_documents=0,
+            )
+        else:
+            print(f"Loading validation dataset split: {args.val_split} ...")
+            val_dataset = PretrainingDataset(
+                tokenizer=tokenizer,
+                dataset_name=args.dataset_name,
+                dataset_config=args.dataset_config,
+                split=args.val_split,
+                context_length=args.context_length,
+                completion_length=args.generation_length,
+                streaming=args.streaming,
+                # Use a small subset for validation to avoid long pauses
+                max_examples=args.max_val_batches * val_bs,
+            )
+        print(f"Validation dataset size: {len(val_dataset)} examples")
+        print(f"Validation batch size: {val_bs}")
+        
+        val_dataloader = DataLoader(
+            dataset=val_dataset,
+            batch_size=val_bs,
+            shuffle=False,
+            collate_fn=partial(collate_fn, pad_token_id=pad_id),
+            drop_last=False,
+            pin_memory=pin_memory if 'pin_memory' in locals() else (device.type == "cuda"),
+            num_workers=0,
+        )
+    else:
+        print("No validation split provided; skipping periodic validation.")
+
+    # ------------------------------------------------------------------
+    # DataLoaders
+    # ------------------------------------------------------------------
     pin_memory = args.pin_memory if args.pin_memory is not None else device.type == "cuda"
     if args.num_workers is None:
         if device.type == "cuda":
@@ -986,6 +1176,31 @@ def train(args: argparse.Namespace) -> None:
                         f"opt={mem.get('opt_step_alloc_mb', 0.0):.0f}/{mem.get('opt_step_reserved_mb', 0.0):.0f}"
                     )
                     print(mem_line)
+
+            if step % args.val_steps == 0 and val_dataloader is not None:
+                print(f"Running validation at step {step}...")
+                val_res = validation_epoch(
+                    model=model,
+                    dataloader=val_dataloader,
+                    num_rollouts=args.num_rollouts,
+                    generation_length=args.generation_length,
+                    gamma=args.gamma,
+                    temperature=args.temperature,
+                    device=device,
+                    max_batches=args.max_val_batches,
+                    whitening=args.whitening,
+                )
+                if val_res:
+                    print(
+                        f"Step {step:6d} [VAL] | loss={val_res['loss']:.4f} "
+                        f"reinforce={val_res['reinforce_loss']:.4f} "
+                        f"ce={val_res['ce_loss']:.4f} "
+                        f"reward={val_res['mean_reward']:.4f} "
+                        f"entropy={val_res['entropy']:.4f}"
+                    )
+                    # Store validation metrics with a prefix
+                    val_metrics = {f"val_{k}": v for k, v in val_res.items()}
+                    metrics_history[-1].update(val_metrics)
 
             if step % args.save_steps == 0:
                 save_path = os.path.join(args.output_dir, f"step_{step}")
