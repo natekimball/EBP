@@ -189,6 +189,16 @@ def parse_args() -> argparse.Namespace:
         "--dataset_name",
         type=str,
         default="allenai/dolma",
+        help="Dataset name or path to a local directory containing a saved dataset.",
+    )
+    parser.add_argument(
+        "--tokenized",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Whether the dataset is already tokenized. If not specified, "
+            "it is automatically enabled if --dataset_name is a directory."
+        ),
     )
     parser.add_argument("--dataset_config", type=str, default="v1_7")
     parser.add_argument("--dataset_split", type=str, default="train")
@@ -947,7 +957,7 @@ def train(args: argparse.Namespace) -> None:
         val_skip_docs = args.max_val_docs
         print(f"Carving out {val_skip_docs} documents from {args.dataset_split} split for validation")
 
-    print(f"Loading dataset: {args.dataset_name}/{args.dataset_config} ...")
+    print(f"Loading dataset: {args.dataset_name} ...")
     dataset = PretrainingDataset(
         tokenizer=tokenizer,
         dataset_name=args.dataset_name,
@@ -959,8 +969,10 @@ def train(args: argparse.Namespace) -> None:
         max_tokens=args.max_tokens,
         max_examples=args.max_examples,
         skip_documents=val_skip_docs,
+        tokenized=args.tokenized,
+        text_column="tokens" if args.tokenized else "text",
     )
-    print("Train dataset loaded in streaming mode")
+    print("Train dataset loaded")
 
     val_dataloader = None
     if args.val_split:
@@ -976,6 +988,8 @@ def train(args: argparse.Namespace) -> None:
                 streaming=args.streaming,
                 max_documents=val_skip_docs,
                 max_examples=args.max_val_batches * val_bs,
+                tokenized=args.tokenized,
+                text_column="tokens" if args.tokenized else "text",
             )
         else:
             print(f"Loading validation dataset split: {args.val_split} ...")
@@ -989,8 +1003,10 @@ def train(args: argparse.Namespace) -> None:
                 streaming=args.streaming,
                 # Use a small subset for validation to avoid long pauses
                 max_examples=args.max_val_batches * val_bs,
+                tokenized=args.tokenized,
+                text_column="tokens" if args.tokenized else "text",
             )
-        print("Validation dataset loaded in streaming mode")
+        print("Validation dataset loaded")
         print(f"Validation batch size: {val_bs}")
         
         val_dataloader = DataLoader(

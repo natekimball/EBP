@@ -10,7 +10,8 @@ cross-entropy term.
 
 from __future__ import annotations
 
-from typing import Dict, Iterator, List, Optional
+import os
+from typing import Dict, Iterator, List, Optional, Union
 
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
@@ -28,6 +29,17 @@ def load_dataset(*args, **kwargs):
     return _load(*args, **kwargs)
 
 
+def load_from_disk(*args, **kwargs):
+    """Thin wrapper around ``datasets.load_from_disk``.
+
+    Defined at module level so tests can patch ``ebp.data.load_from_disk``
+    without importing the heavy ``datasets`` library at import time.
+    """
+    from datasets import load_from_disk as _load  # type: ignore[import]
+
+    return _load(*args, **kwargs)
+
+
 class PretrainingDataset(IterableDataset):
     """Sliding-window text dataset for EBP pretraining.
 
@@ -39,7 +51,8 @@ class PretrainingDataset(IterableDataset):
 
     Args:
         tokenizer: HuggingFace tokeniser used for encoding.
-        dataset_name: Dataset name passed to ``datasets.load_dataset``.
+        dataset_name: Dataset name passed to ``datasets.load_dataset``, or 
+            path to a local directory containing a saved dataset.
         dataset_config: Dataset configuration / subset name, or ``None`` if the
             dataset has no named configuration.
         split: Dataset split (e.g. ``"train"``).
@@ -54,6 +67,8 @@ class PretrainingDataset(IterableDataset):
         streaming: Whether to stream documents from the dataset backend.
         max_tokens: Optional cap on total concatenated tokens before chunking.
         max_examples: Optional cap on number of produced training chunks.
+        tokenized: Whether the dataset already contains token IDs in the 
+            ``text_column``. If True, skips the tokenizer.
     """
 
     def __init__(
@@ -72,6 +87,7 @@ class PretrainingDataset(IterableDataset):
         max_tokens: Optional[int] = None,
         max_examples: Optional[int] = None,
         skip_documents: int = 0,
+        tokenized: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.dataset_name = dataset_name
@@ -88,17 +104,28 @@ class PretrainingDataset(IterableDataset):
         self.max_tokens = max_tokens
         self.max_examples = max_examples
         self.skip_documents = skip_documents
+        self.tokenized = tokenized
+
+        # Auto-detect if loading from local disk
+        self.is_cached = os.path.isdir(dataset_name)
 
     def __iter__(self) -> Iterator[Dict[str, List[int]]]:
         worker_info = get_worker_info()
 
-        raw = load_dataset(
-            self.dataset_name,
-            self.dataset_config,
-            split=self.split,
-            trust_remote_code=True,
-            streaming=self.streaming,
-        )
+        if self.is_cached:
+            raw = load_from_disk(self.dataset_name)
+            # If a split is specified and it's a DatasetDict, pick it
+            from datasets import DatasetDict
+            if isinstance(raw, DatasetDict) and self.split in raw:
+                raw = raw[self.split]
+        else:
+            raw = load_dataset(
+                self.dataset_name,
+                self.dataset_config,
+                split=self.split,
+                trust_remote_code=True,
+                streaming=self.streaming,
+            )
 
         # Multi-worker sharding
         if worker_info is not None:
@@ -131,12 +158,16 @@ class PretrainingDataset(IterableDataset):
             if self.max_tokens is not None and total_tokens >= self.max_tokens:
                 break
 
-            text = item[self.text_column]
-            if len(text.strip()) < self.min_doc_chars:
-                continue
+            data = item[self.text_column]
+            if self.tokenized:
+                # Expecting a list/tensor of token IDs
+                doc_tokens = list(data)
+            else:
+                # Expecting text, needs tokenization
+                if len(data.strip()) < self.min_doc_chars:
+                    continue
+                doc_tokens = self.tokenizer.encode(data, add_special_tokens=False)
 
-            tokens = self.tokenizer.encode(text, add_special_tokens=False)
-            doc_tokens: List[int] = tokens
             if have_previous_doc and eos_id is not None:
                 doc_tokens = [eos_id] + doc_tokens
 
