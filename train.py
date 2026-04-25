@@ -74,12 +74,16 @@ from __future__ import annotations
 import argparse
 import os
 import pickle
+import time
+import wandb
 from functools import partial
 from typing import Iterator, List, Union
 
 import torch
+import torch._dynamo
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+import multiprocessing
 
 from ebp.data import PretrainingDataset, collate_fn
 from ebp.model import EMAEBPModel, OnlineEBPModel
@@ -326,6 +330,26 @@ def parse_args() -> argparse.Namespace:
             "Defaults to <output_dir>/metrics.pkl."
         ),
     )
+    # Logging
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="EBP",
+        help="W&B project name.",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="W&B run name.",
+    )
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+        help="W&B logging mode.",
+    )
     # Misc
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -431,7 +455,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory_constrained",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "Use the memory-constrained training step that backpropagates CE "
             "early before rollout processing. Disable for the regular single-"
@@ -857,9 +881,20 @@ def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
 
     # Optimization: Increase dynamo recompile limit to handle HF cache initialization
-    if hasattr(torch, "_dynamo"):
-        import torch._dynamo as dynamo
-        dynamo.config.recompile_limit = 32
+    # allow unspecized integers (like layer indices) on nn.Module to be dynamic.
+    torch._dynamo.config.allow_unspec_int_on_nn_module = True
+    torch._dynamo.config.recompile_limit = 32
+
+    # multiprocessing.set_start_method('spawn')
+
+    # Initialize W&B
+    wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        config=vars(args),
+        mode=args.wandb_mode,
+        settings=wandb.Settings(silent=True)
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -885,6 +920,7 @@ def train(args: argparse.Namespace) -> None:
     # Tokeniser
     # ------------------------------------------------------------------
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     pad_id = tokenizer.pad_token_id
@@ -1111,6 +1147,38 @@ def train(args: argparse.Namespace) -> None:
     # Wrap dataloader with GPU prefetcher for asynchronous H2D transfer
     prefetched_loader = GPUPrefetcher(dataloader, device)
 
+    # ------------------------------------------------------------------
+    # Baseline validation
+    # ------------------------------------------------------------------
+    if val_dataloader is not None:
+        print("Running baseline validation (step 0)...")
+        baseline_val_start = time.perf_counter()
+        val_res = validation_epoch(
+            model=model,
+            dataloader=val_dataloader,
+            num_rollouts=args.num_rollouts,
+            generation_length=args.generation_length,
+            gamma=args.gamma,
+            temperature=args.temperature,
+            device=device,
+            max_batches=args.max_val_batches,
+            whitening=args.whitening,
+        )
+        baseline_val_duration = time.perf_counter() - baseline_val_start
+        print(f"Baseline validation duration: {baseline_val_duration:.2f}s")
+        if val_res:
+            print(
+                f"Step      0 [VAL] | loss={val_res['loss']:.4f} "
+                f"reinforce={val_res['reinforce_loss']:.4f} "
+                f"ce={val_res['ce_loss']:.4f} "
+                f"reward={val_res['mean_reward']:.4f} "
+                f"entropy={val_res['entropy']:.4f}"
+            )
+            val_metrics = {f"val_{k}": v for k, v in val_res.items()}
+            val_metrics["val_duration_sec"] = baseline_val_duration
+            val_metrics["step"] = 0
+            wandb.log(val_metrics)
+
     while step < args.max_steps:
         for batch in prefetched_loader:
             if step >= args.max_steps:
@@ -1163,6 +1231,8 @@ def train(args: argparse.Namespace) -> None:
                     "entropy": result["entropy"],
                 }
             )
+            # Log to W&B
+            wandb.log(metrics_history[-1])
 
             if step % args.log_steps == 0:
                 print(
@@ -1209,7 +1279,11 @@ def train(args: argparse.Namespace) -> None:
                     )
                     # Store validation metrics with a prefix
                     val_metrics = {f"val_{k}": v for k, v in val_res.items()}
+                    # Ensure step info is included for W&B x-axis consistency if logged separately
+                    val_metrics["step"] = step
                     metrics_history[-1].update(val_metrics)
+                    # Log validation to W&B
+                    wandb.log(val_metrics)
                 
             if step % args.save_steps == 0:
                 save_path = os.path.join(args.output_dir, f"step_{step}")
@@ -1232,6 +1306,8 @@ def train(args: argparse.Namespace) -> None:
     with open(metrics_file, "wb") as fh:
         pickle.dump(metrics_history, fh)
     print(f"Metrics history saved to {metrics_file}")
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":
