@@ -83,7 +83,6 @@ import torch
 import torch._dynamo
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
-import multiprocessing
 
 from ebp.data import PretrainingDataset, collate_fn
 from ebp.model import EMAEBPModel, OnlineEBPModel
@@ -884,8 +883,6 @@ def train(args: argparse.Namespace) -> None:
     # allow unspecized integers (like layer indices) on nn.Module to be dynamic.
     torch._dynamo.config.allow_unspec_int_on_nn_module = True
     torch._dynamo.config.recompile_limit = 32
-
-    # multiprocessing.set_start_method('spawn')
 
     # Initialize W&B
     wandb.init(
