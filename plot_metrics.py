@@ -2,8 +2,9 @@
 Plot training metrics saved by train.py.
 
 Reads a ``metrics.pkl`` file produced by ``train.py`` (a list of per-step
-dicts with keys ``step``, ``loss``, ``reinforce_loss``, ``ce_loss``,
-``mean_reward``, and ``entropy``) and saves a multi-panel figure.
+dicts with keys such as ``step``, ``loss``, ``ce_loss``, ``reinforce_loss``,
+``mean_reward``, and ``entropy``) and saves a multi-panel figure. CE-only runs
+may omit EBP-specific metrics entirely.
 
 Usage
 -----

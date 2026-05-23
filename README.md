@@ -33,6 +33,10 @@ For each training example *(context c, reference completion y)*:
    loss for stable training.
 6. **Update EMA** – `ema ← τ·ema + (1-τ)·θ` (stop-gradient).
 
+For a direct continued-pretraining baseline, pass `--ce_only` to disable the
+feature-matching / REINFORCE objective and optimize only the standard
+cross-entropy loss.
+
 ---
 
 ## Repository layout
@@ -76,6 +80,19 @@ python train.py \
    --lr 1e-5 \
    --max_steps 10000 \
    --output_dir ./output
+
+# Continued pretraining baseline (CE loss only)
+python train.py \
+   --model_name Qwen/Qwen3-0.6B \
+   --dataset_name allenai/dolma \
+   --dataset_config v1_7 \
+   --context_length 128 \
+   --generation_length 8 \
+   --batch_size 4 \
+   --lr 1e-5 \
+   --max_steps 10000 \
+   --ce_only \
+   --output_dir ./output_ce
 ```
 
 ### Key arguments
@@ -87,6 +104,7 @@ python train.py \
 | `--generation_length` | `8` | Tokens generated per rollout |
 | `--ema_decay` | `0.999` | EMA decay factor τ |
 | `--gamma` | `0.1` | Weight of the CE term |
+| `--ce_only` | `false` | Run standard continued pretraining with CE loss only |
 | `--temperature` | `1.0` | Sampling temperature |
 | `--dtype` | `float32` | `float32` / `bfloat16` / `float16` |
 | `--use_fused_adamw` | `true` | Use fused CUDA AdamW kernels when available |
