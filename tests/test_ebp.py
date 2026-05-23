@@ -21,7 +21,7 @@ from ebp.rewards import (
     compute_rloo_baseline_batched,
 )
 from ebp.data import collate_fn
-from train import build_logged_metrics, ce_training_step, ce_validation_epoch
+from train import ce_training_step, ce_validation_epoch
 
 
 # ---------------------------------------------------------------------------
@@ -776,11 +776,11 @@ class TestCEOnlyTraining(unittest.TestCase):
             )
 
         self.assertEqual(result["loss"], result["ce_loss"])
-        self.assertEqual(result["reinforce_loss"], 0.0)
-        self.assertEqual(result["mean_reward"], 0.0)
-        self.assertEqual(result["mean_alignment"], 0.0)
-        self.assertEqual(result["mean_diversity"], 0.0)
-        self.assertEqual(result["entropy"], 0.0)
+        self.assertNotIn("reinforce_loss", result)
+        self.assertNotIn("mean_reward", result)
+        self.assertNotIn("mean_alignment", result)
+        self.assertNotIn("mean_diversity", result)
+        self.assertNotIn("entropy", result)
 
         has_grad = any(
             p.grad is not None and p.grad.abs().sum().item() > 0
@@ -804,60 +804,11 @@ class TestCEOnlyTraining(unittest.TestCase):
             )
 
         self.assertEqual(result["loss"], result["ce_loss"])
-        self.assertEqual(result["reinforce_loss"], 0.0)
-        self.assertEqual(result["mean_reward"], 0.0)
-        self.assertEqual(result["mean_alignment"], 0.0)
-        self.assertEqual(result["mean_diversity"], 0.0)
-        self.assertEqual(result["entropy"], 0.0)
-
-
-class TestMetricLogging(unittest.TestCase):
-    def test_ce_only_logged_metrics_omit_ebp_fields(self):
-        metrics = build_logged_metrics(
-            step=3,
-            result={
-                "loss": 1.5,
-                "ce_loss": 1.5,
-                "reinforce_loss": 0.0,
-                "mean_reward": 0.0,
-                "mean_alignment": 0.0,
-                "mean_diversity": 0.0,
-                "entropy": 0.0,
-            },
-            ce_only=True,
-        )
-
-        self.assertEqual(metrics, {"step": 3, "loss": 1.5, "ce_loss": 1.5})
-
-    def test_ebp_logged_metrics_keep_ebp_fields(self):
-        metrics = build_logged_metrics(
-            step=4,
-            result={
-                "loss": 2.0,
-                "ce_loss": 0.5,
-                "reinforce_loss": 1.5,
-                "mean_reward": 0.25,
-                "mean_alignment": 0.4,
-                "mean_diversity": 0.15,
-                "entropy": 0.8,
-            },
-            ce_only=False,
-            prefix="val_",
-        )
-
-        self.assertEqual(
-            metrics,
-            {
-                "step": 4,
-                "val_loss": 2.0,
-                "val_ce_loss": 0.5,
-                "val_reinforce_loss": 1.5,
-                "val_mean_reward": 0.25,
-                "val_mean_alignment": 0.4,
-                "val_mean_diversity": 0.15,
-                "val_entropy": 0.8,
-            },
-        )
+        self.assertNotIn("reinforce_loss", result)
+        self.assertNotIn("mean_reward", result)
+        self.assertNotIn("mean_alignment", result)
+        self.assertNotIn("mean_diversity", result)
+        self.assertNotIn("entropy", result)
 
 
 if __name__ == "__main__":

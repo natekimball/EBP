@@ -696,42 +696,11 @@ def ce_training_step(
 
     result = {
         "loss": ce_loss.item(),
-        "reinforce_loss": 0.0,
         "ce_loss": ce_loss.item(),
-        "mean_reward": 0.0,
-        "mean_alignment": 0.0,
-        "mean_diversity": 0.0,
-        "entropy": 0.0,
     }
     if cuda_mem:
         result["cuda_mem"] = cuda_mem
     return result
-
-
-def build_logged_metrics(
-    step: int,
-    result: dict,
-    ce_only: bool,
-    prefix: str = "",
-) -> dict:
-    """Build the metrics payload for metrics history / W&B logging."""
-    metrics = {
-        "step": step,
-        f"{prefix}loss": result["loss"],
-        f"{prefix}ce_loss": result["ce_loss"],
-    }
-    if not ce_only:
-        metrics.update(
-            {
-                f"{prefix}reinforce_loss": result["reinforce_loss"],
-                f"{prefix}mean_reward": result["mean_reward"],
-                f"{prefix}mean_alignment": result["mean_alignment"],
-                f"{prefix}mean_diversity": result["mean_diversity"],
-                f"{prefix}entropy": result["entropy"],
-            }
-        )
-    return metrics
-
 
 @torch.no_grad()
 def validation_epoch(
@@ -870,12 +839,7 @@ def ce_validation_epoch(
         all_results.append(
             {
                 "loss": ce_loss.item(),
-                "reinforce_loss": 0.0,
                 "ce_loss": ce_loss.item(),
-                "mean_reward": 0.0,
-                "mean_alignment": 0.0,
-                "mean_diversity": 0.0,
-                "entropy": 0.0,
             }
         )
         count += 1
@@ -1325,12 +1289,21 @@ def train(args: argparse.Namespace) -> None:
                     f"reward={val_res['mean_reward']:.4f} "
                     f"entropy={val_res['entropy']:.4f}"
                 )
-            val_metrics = build_logged_metrics(
-                step=0,
-                result=val_res,
-                ce_only=args.ce_only,
-                prefix="val_",
-            )
+            val_metrics = {
+                "step": 0,
+                "val_loss": val_res["loss"],
+                "val_ce_loss": val_res["ce_loss"],
+            }
+            for key in (
+                "reinforce_loss",
+                "mean_reward",
+                "mean_alignment",
+                "mean_diversity",
+                "entropy",
+            ):
+                value = val_res.get(key)
+                if value is not None:
+                    val_metrics[f"val_{key}"] = value
             val_metrics["val_duration_sec"] = baseline_val_duration
             wandb.log(val_metrics)
 
@@ -1380,13 +1353,22 @@ def train(args: argparse.Namespace) -> None:
             loss_val = result["loss"]
 
             # Record metrics for every step (floats only, very lightweight)
-            metrics_history.append(
-                build_logged_metrics(
-                    step=step,
-                    result=result,
-                    ce_only=args.ce_only,
-                )
-            )
+            train_metrics = {
+                "step": step,
+                "loss": loss_val,
+                "ce_loss": result["ce_loss"],
+            }
+            for key in (
+                "reinforce_loss",
+                "mean_reward",
+                "mean_alignment",
+                "mean_diversity",
+                "entropy",
+            ):
+                value = result.get(key)
+                if value is not None:
+                    train_metrics[key] = value
+            metrics_history.append(train_metrics)
             # Log to W&B
             wandb.log(metrics_history[-1])
 
@@ -1452,12 +1434,21 @@ def train(args: argparse.Namespace) -> None:
                             f"entropy={val_res['entropy']:.4f}"
                         )
                     # Store validation metrics with a prefix
-                    val_metrics = build_logged_metrics(
-                        step=step,
-                        result=val_res,
-                        ce_only=args.ce_only,
-                        prefix="val_",
-                    )
+                    val_metrics = {
+                        "step": step,
+                        "val_loss": val_res["loss"],
+                        "val_ce_loss": val_res["ce_loss"],
+                    }
+                    for key in (
+                        "reinforce_loss",
+                        "mean_reward",
+                        "mean_alignment",
+                        "mean_diversity",
+                        "entropy",
+                    ):
+                        value = val_res.get(key)
+                        if value is not None:
+                            val_metrics[f"val_{key}"] = value
                     metrics_history[-1].update(val_metrics)
                     # Log validation to W&B
                     wandb.log(val_metrics)
