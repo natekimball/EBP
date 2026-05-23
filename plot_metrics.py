@@ -89,6 +89,11 @@ def parse_args() -> argparse.Namespace:
         default=120,
         help="Figure DPI for saved images (default: 120).",
     )
+    parser.add_argument(
+        "--log_x",
+        action="store_true",
+        help="Use a logarithmic scale for the x-axis (step).",
+    )
     return parser.parse_args()
 
 
@@ -127,74 +132,97 @@ def main() -> None:
 
     ncols = 3
     nrows = -(-len(panels) // ncols)  # ceiling division
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
-    if nrows == 1 and ncols == 1:
-        axes_flat = [axes]
-    else:
-        axes_flat = axes.flatten()
+    
+    # -------------------------------------------------------------------------
+    # 1. Plot Training Metrics
+    # -------------------------------------------------------------------------
+    fig_train, axes_train = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+    axes_train_flat = axes_train.flatten() if nrows * ncols > 1 else [axes_train]
 
-    for ax, (key, ylabel, title, include_val) in zip(axes_flat, panels):
-        # 1. Plot train data
+    for ax, (key, ylabel, title, _) in zip(axes_train_flat, panels):
         valid_train = [(m["step"], m[key]) for m in history if key in m]
         if not valid_train:
-            ax.set_title(f"{title}\n(no data)", fontsize=11)
-            ax.set_visible(True)
+            ax.set_title(f"Train {title}\n(no data)", fontsize=11)
             continue
+        
         train_steps, train_values = zip(*valid_train)
-
         color_train = "tab:blue"
-        color_val = "tab:orange"
 
         if alpha > 0.0:
-            # Plot raw train values as a faint background
             ax.plot(train_steps, train_values, color=color_train, alpha=0.15, linewidth=0.6)
             smoothed = ema_smooth(list(train_values), alpha)
-            ax.plot(
-                train_steps, smoothed,
-                color=color_train, linewidth=1.5,
-                label="Train (EMA)",
-            )
+            ax.plot(train_steps, smoothed, color=color_train, linewidth=1.5, label="Train (EMA)")
+            ax.legend(fontsize=8)
         else:
-            ax.plot(train_steps, train_values, color=color_train, linewidth=1.0, label="Train")
+            ax.plot(train_steps, train_values, color=color_train, linewidth=1.0)
 
-        # 2. Plot validation data (if present and requested)
-        val_key = f"val_{key}"
-        valid_val = [(m["step"], m[val_key]) for m in history if val_key in m]
-        if include_val and valid_val:
-            val_steps, val_values = zip(*valid_val)
-            # Validation is usually sparse, so we use markers + lines
-            ax.plot(
-                val_steps, val_values,
-                color=color_val, marker="o", markersize=4,
-                linewidth=1.2, label="Val",
-            )
-
-        ax.set_title(title, fontsize=11)
+        ax.set_title(f"Train {title}", fontsize=11)
         ax.set_xlabel("Step", fontsize=9)
         ax.set_ylabel(ylabel, fontsize=9)
+        if args.log_x:
+            ax.set_xscale("log")
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.tick_params(labelsize=8)
-        
-        # Only show legend if we have two types of data or if smoothing is on
-        if (include_val and valid_val) or alpha > 0.0:
-            ax.legend(fontsize=8)
 
-    # Hide any unused subplot panels
-    for ax in axes_flat[len(panels):]:
+    for ax in axes_train_flat[len(panels):]:
         ax.set_visible(False)
+    fig_train.suptitle("EBP Training Metrics (Train)", fontsize=14, fontweight="bold")
+    fig_train.tight_layout()
 
-    fig.suptitle("EBP Training Metrics", fontsize=14, fontweight="bold")
-    fig.tight_layout()
+    # -------------------------------------------------------------------------
+    # 2. Plot Validation Metrics
+    # -------------------------------------------------------------------------
+    fig_val, axes_val = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+    axes_val_flat = axes_val.flatten() if nrows * ncols > 1 else [axes_val]
+    has_any_val = False
+
+    for ax, (key, ylabel, title, include_val) in zip(axes_val_flat, panels):
+        val_key = f"val_{key}"
+        valid_val = [(m["step"], m[val_key]) for m in history if include_val and val_key in m]
+        
+        if not valid_val:
+            ax.set_title(f"Val {title}\n(no data)", fontsize=11)
+            continue
+        
+        has_any_val = True
+        val_steps, val_values = zip(*valid_val)
+        color_val = "tab:orange"
+        
+        ax.plot(val_steps, val_values, color=color_val, marker="o", markersize=4, linewidth=1.2)
+        ax.set_title(f"Val {title}", fontsize=11)
+        ax.set_xlabel("Step", fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=9)
+        if args.log_x:
+            ax.set_xscale("log")
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.tick_params(labelsize=8)
+
+    for ax in axes_val_flat[len(panels):]:
+        ax.set_visible(False)
+    fig_val.suptitle("EBP Training Metrics (Validation)", fontsize=14, fontweight="bold")
+    fig_val.tight_layout()
 
     if args.show:
         plt.show()
     else:
         out_path = args.output
         if out_path is None:
-            out_path = str(Path(args.metrics_file).with_name("metrics.png"))
-        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=args.dpi, bbox_inches="tight")
-        print(f"Figure saved to {out_path}")
+            out_base = Path(args.metrics_file).with_suffix("")
+            train_path = out_base.parent / f"{out_base.name}_train.png"
+            val_path = out_base.parent / f"{out_base.name}_val.png"
+        else:
+            p = Path(out_path)
+            train_path = p.parent / f"{p.stem}_train{p.suffix}"
+            val_path = p.parent / f"{p.stem}_val{p.suffix}"
+
+        train_path.parent.mkdir(parents=True, exist_ok=True)
+        fig_train.savefig(train_path, dpi=args.dpi, bbox_inches="tight")
+        print(f"Training figure saved to {train_path}")
+        
+        if has_any_val:
+            fig_val.savefig(val_path, dpi=args.dpi, bbox_inches="tight")
+            print(f"Validation figure saved to {val_path}")
+        plt.close("all")
 
 
 if __name__ == "__main__":
