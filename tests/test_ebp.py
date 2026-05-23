@@ -8,6 +8,7 @@ that they run quickly without downloading any pretrained weights.
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import torch
 from transformers import Qwen2Config, Qwen2ForCausalLM
@@ -20,6 +21,7 @@ from ebp.rewards import (
     compute_rloo_baseline_batched,
 )
 from ebp.data import collate_fn
+from train import ce_training_step, ce_validation_epoch
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +748,67 @@ class TestOnlineEndToEndStep(unittest.TestCase):
             for p in ebp.model.parameters()
         )
         self.assertTrue(has_grad)
+
+
+class TestCEOnlyTraining(unittest.TestCase):
+    def _make_batch(self):
+        batch_size, context_len, gen_len = 2, 8, 4
+        return {
+            "context_ids": torch.randint(0, TINY_CONFIG.vocab_size, (batch_size, context_len)),
+            "context_mask": torch.ones(batch_size, context_len, dtype=torch.long),
+            "completion_ids": torch.randint(0, TINY_CONFIG.vocab_size, (batch_size, gen_len)),
+            "completion_mask": torch.ones(batch_size, gen_len, dtype=torch.long),
+        }
+
+    def test_ce_training_step_skips_rollouts(self):
+        ebp = make_online_model()
+        ebp.model.train()
+
+        with patch.object(
+            ebp,
+            "generate_rollouts",
+            side_effect=AssertionError("CE-only path should not generate rollouts"),
+        ):
+            result = ce_training_step(
+                model=ebp,
+                batch=self._make_batch(),
+                device=torch.device("cpu"),
+            )
+
+        self.assertEqual(result["loss"], result["ce_loss"])
+        self.assertEqual(result["reinforce_loss"], 0.0)
+        self.assertEqual(result["mean_reward"], 0.0)
+        self.assertEqual(result["mean_alignment"], 0.0)
+        self.assertEqual(result["mean_diversity"], 0.0)
+        self.assertEqual(result["entropy"], 0.0)
+
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum().item() > 0
+            for p in ebp.model.parameters()
+        )
+        self.assertTrue(has_grad)
+
+    def test_ce_validation_epoch_skips_rollouts(self):
+        ebp = make_online_model()
+
+        with patch.object(
+            ebp,
+            "generate_rollouts",
+            side_effect=AssertionError("CE-only validation should not generate rollouts"),
+        ):
+            result = ce_validation_epoch(
+                model=ebp,
+                dataloader=[self._make_batch()],
+                device=torch.device("cpu"),
+                max_batches=1,
+            )
+
+        self.assertEqual(result["loss"], result["ce_loss"])
+        self.assertEqual(result["reinforce_loss"], 0.0)
+        self.assertEqual(result["mean_reward"], 0.0)
+        self.assertEqual(result["mean_alignment"], 0.0)
+        self.assertEqual(result["mean_diversity"], 0.0)
+        self.assertEqual(result["entropy"], 0.0)
 
 
 if __name__ == "__main__":

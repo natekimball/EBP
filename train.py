@@ -23,6 +23,10 @@ Two model variants are available via ``--model_type``:
 Both variants use a prefix KV cache during rollout generation so that the
 context is processed only once regardless of ``--num_rollouts``.
 
+For a direct continued-pretraining baseline, pass ``--ce_only`` to disable the
+feature-matching / REINFORCE objective entirely and optimise only the standard
+teacher-forced cross-entropy loss.
+
 Metrics
 -------
 Every step the following scalars are logged to stdout and accumulated in a
@@ -276,6 +280,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.1,
         help="Weight of the cross-entropy term in the mixed objective.",
+    )
+    parser.add_argument(
+        "--ce_only",
+        action="store_true",
+        help=(
+            "Disable rollout generation and feature-matching so training runs as "
+            "standard continued pretraining with cross-entropy loss only."
+        ),
     )
     parser.add_argument(
         "--temperature",
@@ -650,6 +662,52 @@ def training_step(
     return result
 
 
+def ce_training_step(
+    model: Union[EMAEBPModel, OnlineEBPModel],
+    batch: dict,
+    device: torch.device,
+    log_cuda_memory: bool = False,
+) -> dict:
+    """Standard continued-pretraining step using CE loss only."""
+    context_ids = batch["context_ids"]
+    context_mask = batch["context_mask"]
+    completion_ids = batch["completion_ids"]
+    completion_mask = batch["completion_mask"]
+
+    full_ids = torch.cat([context_ids, completion_ids], dim=1)
+    full_mask = torch.cat([context_mask, completion_mask], dim=1)
+
+    cuda_mem = {}
+    if log_cuda_memory and device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    model.train()
+    ce_loss = model(
+        input_ids=full_ids,
+        attention_mask=full_mask,
+        labels=full_ids,
+        use_cache=False,
+    ).loss
+    ce_loss.backward()
+
+    if log_cuda_memory and device.type == "cuda":
+        cuda_mem["backward_alloc_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        cuda_mem["backward_reserved_mb"] = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+
+    result = {
+        "loss": ce_loss.item(),
+        "reinforce_loss": 0.0,
+        "ce_loss": ce_loss.item(),
+        "mean_reward": 0.0,
+        "mean_alignment": 0.0,
+        "mean_diversity": 0.0,
+        "entropy": 0.0,
+    }
+    if cuda_mem:
+        result["cuda_mem"] = cuda_mem
+    return result
+
+
 @torch.no_grad()
 def validation_epoch(
     model: Union[EMAEBPModel, OnlineEBPModel],
@@ -751,6 +809,59 @@ def validation_epoch(
         for k in all_results[0].keys()
     }
     return avg_res
+
+
+@torch.no_grad()
+def ce_validation_epoch(
+    model: Union[EMAEBPModel, OnlineEBPModel],
+    dataloader: DataLoader,
+    device: torch.device,
+    max_batches: int = 50,
+) -> dict:
+    """Computes mean CE-only validation metrics over validation batches."""
+    model.eval()
+    all_results = []
+
+    count = 0
+    for batch in dataloader:
+        if count >= max_batches:
+            break
+
+        batch_device = {k: v.to(device, non_blocking=False) for k, v in batch.items()}
+        full_ids = torch.cat(
+            [batch_device["context_ids"], batch_device["completion_ids"]], dim=1
+        )
+        full_mask = torch.cat(
+            [batch_device["context_mask"], batch_device["completion_mask"]], dim=1
+        )
+
+        ce_loss = model(
+            input_ids=full_ids,
+            attention_mask=full_mask,
+            labels=full_ids,
+            use_cache=False,
+        ).loss
+
+        all_results.append(
+            {
+                "loss": ce_loss.item(),
+                "reinforce_loss": 0.0,
+                "ce_loss": ce_loss.item(),
+                "mean_reward": 0.0,
+                "mean_alignment": 0.0,
+                "mean_diversity": 0.0,
+                "entropy": 0.0,
+            }
+        )
+        count += 1
+
+    if not all_results:
+        return {}
+
+    return {
+        k: sum(r[k] for r in all_results) / len(all_results)
+        for k in all_results[0].keys()
+    }
 
 
 def memory_constrained_training_step(
@@ -1134,12 +1245,18 @@ def train(args: argparse.Namespace) -> None:
     # before rollout tensors/activations are created. Alternative (often faster
     # when memory headroom exists): keep CE and REINFORCE in one combined loss
     # and call backward once.
-    if args.memory_constrained:
+    if args.ce_only:
+        print("Using CE-only training step (continued pretraining baseline)")
+        step_fn = ce_training_step
+        validation_fn = ce_validation_epoch
+    elif args.memory_constrained:
         print("Using memory-constrained training step (early CE backward)")
         step_fn = memory_constrained_training_step
+        validation_fn = validation_epoch
     else:
         print("Using regular training step (single backward, CE/ref after rollouts)")
         step_fn = training_step
+        validation_fn = validation_epoch
 
     # Wrap dataloader with GPU prefetcher for asynchronous H2D transfer
     prefetched_loader = GPUPrefetcher(dataloader, device)
@@ -1150,17 +1267,23 @@ def train(args: argparse.Namespace) -> None:
     if val_dataloader is not None:
         print("Running baseline validation (step 0)...")
         baseline_val_start = time.perf_counter()
-        val_res = validation_epoch(
-            model=model,
-            dataloader=val_dataloader,
-            num_rollouts=args.num_rollouts,
-            generation_length=args.generation_length,
-            gamma=args.gamma,
-            temperature=args.temperature,
-            device=device,
-            max_batches=args.max_val_batches,
-            whitening=args.whitening,
-        )
+        validation_kwargs = {
+            "model": model,
+            "dataloader": val_dataloader,
+            "device": device,
+            "max_batches": args.max_val_batches,
+        }
+        if not args.ce_only:
+            validation_kwargs.update(
+                {
+                    "num_rollouts": args.num_rollouts,
+                    "generation_length": args.generation_length,
+                    "gamma": args.gamma,
+                    "temperature": args.temperature,
+                    "whitening": args.whitening,
+                }
+            )
+        val_res = validation_fn(**validation_kwargs)
         baseline_val_duration = time.perf_counter() - baseline_val_start
         print(f"Baseline validation duration: {baseline_val_duration:.2f}s")
         if val_res:
@@ -1183,17 +1306,23 @@ def train(args: argparse.Namespace) -> None:
 
             optimizer.zero_grad(set_to_none=True)
 
-            result = step_fn(
-                model=model,
-                batch=batch,
-                num_rollouts=args.num_rollouts,
-                generation_length=args.generation_length,
-                gamma=args.gamma,
-                temperature=args.temperature,
-                device=device,
-                log_cuda_memory=args.log_cuda_memory,
-                whitening=args.whitening,
-            )
+            step_kwargs = {
+                "model": model,
+                "batch": batch,
+                "device": device,
+                "log_cuda_memory": args.log_cuda_memory,
+            }
+            if not args.ce_only:
+                step_kwargs.update(
+                    {
+                        "num_rollouts": args.num_rollouts,
+                        "generation_length": args.generation_length,
+                        "gamma": args.gamma,
+                        "temperature": args.temperature,
+                        "whitening": args.whitening,
+                    }
+                )
+            result = step_fn(**step_kwargs)
             torch.nn.utils.clip_grad_norm_(model.model.parameters(), args.grad_clip)
             if args.log_cuda_memory and device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
@@ -1207,7 +1336,7 @@ def train(args: argparse.Namespace) -> None:
                 )
 
             # Update EMA feature network (only for EMAEBPModel)
-            if isinstance(model, EMAEBPModel):
+            if isinstance(model, EMAEBPModel) and not args.ce_only:
                 model.update_ema()
 
             step += 1
@@ -1255,17 +1384,23 @@ def train(args: argparse.Namespace) -> None:
 
             if step % args.val_steps == 0 and val_dataloader is not None:
                 print(f"Running validation at step {step}...")
-                val_res = validation_epoch(
-                    model=model,
-                    dataloader=val_dataloader,
-                    num_rollouts=args.num_rollouts,
-                    generation_length=args.generation_length,
-                    gamma=args.gamma,
-                    temperature=args.temperature,
-                    device=device,
-                    max_batches=args.max_val_batches,
-                    whitening=args.whitening,
-                )
+                validation_kwargs = {
+                    "model": model,
+                    "dataloader": val_dataloader,
+                    "device": device,
+                    "max_batches": args.max_val_batches,
+                }
+                if not args.ce_only:
+                    validation_kwargs.update(
+                        {
+                            "num_rollouts": args.num_rollouts,
+                            "generation_length": args.generation_length,
+                            "gamma": args.gamma,
+                            "temperature": args.temperature,
+                            "whitening": args.whitening,
+                        }
+                    )
+                val_res = validation_fn(**validation_kwargs)
                 if val_res:
                     print(
                         f"Step {step:6d} [VAL] | loss={val_res['loss']:.4f} "
