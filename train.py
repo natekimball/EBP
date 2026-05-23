@@ -708,6 +708,31 @@ def ce_training_step(
     return result
 
 
+def build_logged_metrics(
+    step: int,
+    result: dict,
+    ce_only: bool,
+    prefix: str = "",
+) -> dict:
+    """Build the metrics payload for metrics history / W&B logging."""
+    metrics = {
+        "step": step,
+        f"{prefix}loss": result["loss"],
+        f"{prefix}ce_loss": result["ce_loss"],
+    }
+    if not ce_only:
+        metrics.update(
+            {
+                f"{prefix}reinforce_loss": result["reinforce_loss"],
+                f"{prefix}mean_reward": result["mean_reward"],
+                f"{prefix}mean_alignment": result["mean_alignment"],
+                f"{prefix}mean_diversity": result["mean_diversity"],
+                f"{prefix}entropy": result["entropy"],
+            }
+        )
+    return metrics
+
+
 @torch.no_grad()
 def validation_epoch(
     model: Union[EMAEBPModel, OnlineEBPModel],
@@ -1287,16 +1312,26 @@ def train(args: argparse.Namespace) -> None:
         baseline_val_duration = time.perf_counter() - baseline_val_start
         print(f"Baseline validation duration: {baseline_val_duration:.2f}s")
         if val_res:
-            print(
-                f"Step      0 [VAL] | loss={val_res['loss']:.4f} "
-                f"reinforce={val_res['reinforce_loss']:.4f} "
-                f"ce={val_res['ce_loss']:.4f} "
-                f"reward={val_res['mean_reward']:.4f} "
-                f"entropy={val_res['entropy']:.4f}"
+            if args.ce_only:
+                print(
+                    f"Step      0 [VAL] | loss={val_res['loss']:.4f} "
+                    f"ce={val_res['ce_loss']:.4f}"
+                )
+            else:
+                print(
+                    f"Step      0 [VAL] | loss={val_res['loss']:.4f} "
+                    f"reinforce={val_res['reinforce_loss']:.4f} "
+                    f"ce={val_res['ce_loss']:.4f} "
+                    f"reward={val_res['mean_reward']:.4f} "
+                    f"entropy={val_res['entropy']:.4f}"
+                )
+            val_metrics = build_logged_metrics(
+                step=0,
+                result=val_res,
+                ce_only=args.ce_only,
+                prefix="val_",
             )
-            val_metrics = {f"val_{k}": v for k, v in val_res.items()}
             val_metrics["val_duration_sec"] = baseline_val_duration
-            val_metrics["step"] = 0
             wandb.log(val_metrics)
 
     while step < args.max_steps:
@@ -1346,30 +1381,31 @@ def train(args: argparse.Namespace) -> None:
 
             # Record metrics for every step (floats only, very lightweight)
             metrics_history.append(
-                {
-                    "step": step,
-                    "loss": loss_val,
-                    "reinforce_loss": result["reinforce_loss"],
-                    "ce_loss": result["ce_loss"],
-                    "mean_reward": result["mean_reward"],
-                    "mean_alignment": result["mean_alignment"],
-                    "mean_diversity": result["mean_diversity"],
-                    "entropy": result["entropy"],
-                }
+                build_logged_metrics(
+                    step=step,
+                    result=result,
+                    ce_only=args.ce_only,
+                )
             )
             # Log to W&B
             wandb.log(metrics_history[-1])
 
             if step % args.log_steps == 0:
-                print(
-                    f"Step {step:6d} | loss={loss_val:.4f} "
-                    f"reinforce={result['reinforce_loss']:.4f} "
-                    f"ce={result['ce_loss']:.4f} "
-                    f"reward={result['mean_reward']:.4f} "
-                    f"align={result['mean_alignment']:.4f} "
-                    f"div={result['mean_diversity']:.4f} "
-                    f"entropy={result['entropy']:.4f}"
-                )
+                if args.ce_only:
+                    print(
+                        f"Step {step:6d} | loss={loss_val:.4f} "
+                        f"ce={result['ce_loss']:.4f}"
+                    )
+                else:
+                    print(
+                        f"Step {step:6d} | loss={loss_val:.4f} "
+                        f"reinforce={result['reinforce_loss']:.4f} "
+                        f"ce={result['ce_loss']:.4f} "
+                        f"reward={result['mean_reward']:.4f} "
+                        f"align={result['mean_alignment']:.4f} "
+                        f"div={result['mean_diversity']:.4f} "
+                        f"entropy={result['entropy']:.4f}"
+                    )
                 if args.log_cuda_memory and device.type == "cuda" and "cuda_mem" in result:
                     mem = result["cuda_mem"]
                     mem_line = (
@@ -1402,17 +1438,26 @@ def train(args: argparse.Namespace) -> None:
                     )
                 val_res = validation_fn(**validation_kwargs)
                 if val_res:
-                    print(
-                        f"Step {step:6d} [VAL] | loss={val_res['loss']:.4f} "
-                        f"reinforce={val_res['reinforce_loss']:.4f} "
-                        f"ce={val_res['ce_loss']:.4f} "
-                        f"reward={val_res['mean_reward']:.4f} "
-                        f"entropy={val_res['entropy']:.4f}"
-                    )
+                    if args.ce_only:
+                        print(
+                            f"Step {step:6d} [VAL] | loss={val_res['loss']:.4f} "
+                            f"ce={val_res['ce_loss']:.4f}"
+                        )
+                    else:
+                        print(
+                            f"Step {step:6d} [VAL] | loss={val_res['loss']:.4f} "
+                            f"reinforce={val_res['reinforce_loss']:.4f} "
+                            f"ce={val_res['ce_loss']:.4f} "
+                            f"reward={val_res['mean_reward']:.4f} "
+                            f"entropy={val_res['entropy']:.4f}"
+                        )
                     # Store validation metrics with a prefix
-                    val_metrics = {f"val_{k}": v for k, v in val_res.items()}
-                    # Ensure step info is included for W&B x-axis consistency if logged separately
-                    val_metrics["step"] = step
+                    val_metrics = build_logged_metrics(
+                        step=step,
+                        result=val_res,
+                        ce_only=args.ce_only,
+                        prefix="val_",
+                    )
                     metrics_history[-1].update(val_metrics)
                     # Log validation to W&B
                     wandb.log(val_metrics)
