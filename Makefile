@@ -70,12 +70,35 @@ test:
 		--val_steps 1000 \
 		--val_batch_size 8 \
 		--max_val_batches 100
-		
-# 		--log_steps 500 \
-# 		--val_steps 1000 \
+		--wandb_run_name EBP
 
-# 	 --val_split train --val_steps 100 --val_batch_size 8
-# 		--num_workers 4 \
+cpt:
+	python train.py \
+	    --ce_only \
+		--model_type online \
+		--dataset_name data/Nemotron-CC-Math-v1_4plus \
+		--tokenized \
+		--context_length 1024 \
+		--generation_length 8 \
+		--num_rollouts 8 \
+		--batch_size 8 \
+		--gradient_checkpointing \
+		--log_steps 500 \
+		--save_steps 10_000 \
+		--max_steps 1_000_000 \
+		--gradient_checkpointing \
+		--use_fused_adamw \
+		--use_flash_attention \
+		--num_workers 4 \
+		--compile_model \
+		--memory_constrained \
+		--val_split test \
+		--val_steps 1000 \
+		--val_batch_size 8 \
+		--max_val_batches 100 \
+		--wandb_run_name CPT \
+		--output_dir cpt_output
+
 
 # 		--dtype float16 \
 
