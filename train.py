@@ -85,6 +85,9 @@ from typing import Iterator, List, Union
 
 import torch
 import torch._dynamo
+import random
+import numpy as np
+import os
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
@@ -977,7 +980,13 @@ def memory_constrained_training_step(
 
 
 def train(args: argparse.Namespace) -> None:
+    # Deterministic seeding for reproducible dataset iteration and workers
+    os.environ["PYTHONHASHSEED"] = str(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     # Optimization: Increase dynamo recompile limit to handle HF cache initialization
     # allow unspecized integers (like layer indices) on nn.Module to be dynamic.
@@ -1173,6 +1182,13 @@ def train(args: argparse.Namespace) -> None:
         else num_workers > 0
     )
 
+    # Seed DataLoader workers for deterministic behaviour when num_workers>0
+    def _worker_init_fn(worker_id: int) -> None:
+        worker_seed = args.seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
     dataloader_kwargs = {
         "dataset": dataset,
         "batch_size": args.batch_size,
@@ -1185,6 +1201,7 @@ def train(args: argparse.Namespace) -> None:
     if num_workers > 0:
         dataloader_kwargs["persistent_workers"] = persistent_workers
         dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+        dataloader_kwargs["worker_init_fn"] = _worker_init_fn
 
     print(
         "DataLoader settings: "
