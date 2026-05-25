@@ -495,14 +495,26 @@ class EMAEBPModel(nn.Module):
 
         ``ema_param <- decay * ema_param + (1 - decay) * param``
 
-        Non-parameter buffers (e.g. layer-norm running stats) are copied
-        directly so they stay in sync with the generator.
+        Uses fast ``_foreach`` operations to minimize Python overhead and
+        ensure graph-compatibility.
         """
-        for ema_p, p in zip(self.ema_model.parameters(), self.model.parameters()):
-            ema_p.data.mul_(self.ema_decay).add_(p.data, alpha=1.0 - self.ema_decay)
+        ema_params = list(self.ema_model.parameters())
+        main_params = list(self.model.parameters())
 
-        for ema_buf, buf in zip(self.ema_model.buffers(), self.model.buffers()):
-            ema_buf.data.copy_(buf.data)
+        if hasattr(torch, "_foreach_lerp_"):
+            torch._foreach_lerp_(ema_params, main_params, 1.0 - self.ema_decay)
+        else:
+            for ema_p, p in zip(ema_params, main_params):
+                ema_p.lerp_(p, 1.0 - self.ema_decay)
+
+        ema_bufs = list(self.ema_model.buffers())
+        main_bufs = list(self.model.buffers())
+
+        if hasattr(torch, "_foreach_copy_"):
+            torch._foreach_copy_(ema_bufs, main_bufs)
+        else:
+            for ema_buf, buf in zip(ema_bufs, main_bufs):
+                ema_buf.copy_(buf)
 
 
 # ---------------------------------------------------------------------------

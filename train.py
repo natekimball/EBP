@@ -506,6 +506,70 @@ def _configure_tensor_cores(device: torch.device) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _train_kernel(
+    model: Union[EMAEBPModel, OnlineEBPModel],
+    rollout_ids: torch.Tensor,
+    rollout_masks: torch.Tensor,
+    full_ids: torch.Tensor,
+    full_mask: torch.Tensor,
+    context_len: int,
+    num_rollouts: int,
+    gamma: float,
+    whitening: bool,
+    generation_length: int,
+) -> Tuple[torch.Tensor, ...]:
+    """Graphed training kernel containing forward, rewards, and backward.
+
+    This function avoids all CPU synchronization (.item() calls) to enable
+    full CUDA graph capture when compiled with fullgraph=True.
+    """
+    # 3. Rollout features + log-probs
+    rollout_features, rollout_log_probs = model.compute_rollout_data(
+        rollout_ids, rollout_masks, completion_start=context_len
+    )
+
+    # 4. Reference features and CE
+    ce_loss, ref_features = model.forward_ce_and_ref_features(
+        full_ids,
+        full_mask,
+        completion_start=context_len,
+    )
+
+    # 5. Feature-matching rewards and REINFORCE loss
+    if whitening:
+        alignment, diversity = compute_whitened_feature_matching_terms_batched(
+            rollout_features, ref_features, num_rollouts
+        )
+    else:
+        alignment, diversity = compute_feature_matching_terms_batched(
+            rollout_features, ref_features, num_rollouts
+        )
+    rewards = alignment - diversity  # (B * n,)
+
+    baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
+    advantages = (rewards - baselines).detach()  # stop-gradient on advantages
+
+    # REINFORCE: specialise maximise E[advantage * log p]  ->  minimise negation
+    reinforce_loss = -(advantages * rollout_log_probs).mean()
+
+    # 6. Optional cross-entropy term
+    total_loss = reinforce_loss
+    if gamma > 0.0:
+        total_loss = total_loss + gamma * ce_loss
+
+    total_loss.backward()
+
+    return (
+        total_loss,
+        reinforce_loss,
+        ce_loss,
+        rewards,
+        alignment,
+        diversity,
+        rollout_log_probs,
+    )
+
+
 def training_step(
     model: Union[EMAEBPModel, OnlineEBPModel],
     batch: dict,
@@ -584,74 +648,41 @@ def training_step(
     # rollout_masks: (B * n, context_len + generation_length)
 
     # ------------------------------------------------------------------
-    # 3. Rollout features + log-probs
-    #    EMAEBPModel:    two forward passes (EMA features + generator log-probs)
-    #    OnlineEBPModel: one forward pass (features detached + log-probs with grad)
+    # 3-6. Training kernel (Rollout data, Rewards, Backward)
     # ------------------------------------------------------------------
     model.train()
-    _reset_cuda_peak("rollout_fwd")
-    rollout_features, rollout_log_probs = model.compute_rollout_data(
-        rollout_ids, rollout_masks, completion_start=context_len
+    _reset_cuda_peak("train_kernel")
+    (
+        total_loss,
+        reinforce_loss,
+        ce_loss,
+        rewards,
+        alignment,
+        diversity,
+        rollout_log_probs,
+    ) = _train_kernel(
+        model=model,
+        rollout_ids=rollout_ids,
+        rollout_masks=rollout_masks,
+        full_ids=full_ids,
+        full_mask=full_mask,
+        context_len=context_len,
+        num_rollouts=num_rollouts,
+        gamma=gamma,
+        whitening=whitening,
+        generation_length=generation_length,
     )
-    _record_cuda_peak("rollout_fwd")
-    # rollout_features:  (B * n, feat_dim)  - detached
-    # rollout_log_probs: (B * n,)           - differentiable
+    _record_cuda_peak("train_kernel")
 
-    # ------------------------------------------------------------------
-    # 4. Reference features and CE
-    # ------------------------------------------------------------------
-    _reset_cuda_peak("ref")
-    ce_loss, ref_features = model.forward_ce_and_ref_features(
-        full_ids,
-        full_mask,
-        completion_start=context_len,
-    )
-    _record_cuda_peak("ref")
+    # Now extract scalars for result dict outside the (potentially) graphed kernel
     ce_loss_val = ce_loss.item()
-
-    # ------------------------------------------------------------------
-    # 5. Feature-matching rewards and REINFORCE loss
-    # ------------------------------------------------------------------
-    if whitening:
-        alignment, diversity = compute_whitened_feature_matching_terms_batched(
-            rollout_features, ref_features, num_rollouts
-        )
-    else:
-        alignment, diversity = compute_feature_matching_terms_batched(
-            rollout_features, ref_features, num_rollouts
-        )
-    rewards = alignment - diversity  # (B * n,)
-
-    baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
-    advantages = (rewards - baselines).detach()  # stop-gradient on advantages
-
-    # REINFORCE: maximise E[advantage * log p]  ->  minimise negation
-    reinforce_loss = -(advantages * rollout_log_probs).mean()
-
-    # Mean reward / alignment / diversity across all rollouts (diagnostics)
     mean_reward = rewards.detach().mean().item()
     mean_alignment = alignment.detach().mean().item()
     mean_diversity = diversity.detach().mean().item()
-
-    # Per-token NLL of rollout sequences (proxy for policy entropy).
-    # NLL = -mean(log p) / gen_len.  By Jensen's inequality, H(p) ≥ NLL,
-    # so this is a lower bound on entropy: higher = more exploratory policy.
     policy_nll = (-rollout_log_probs.detach().mean() / max(generation_length, 1)).item()
 
-    # ------------------------------------------------------------------
-    # 6. Optional cross-entropy term
-    # ------------------------------------------------------------------
-    total_loss = reinforce_loss
-
-    if gamma > 0.0:
-        total_loss = total_loss + gamma * ce_loss
-
-    _reset_cuda_peak("backward")
-    total_loss.backward()
-    _record_cuda_peak("backward")
-
     result = {
-        "loss": total_loss.item(),
+        "loss": reinforce_loss.item() + gamma * ce_loss_val,
         "reinforce_loss": reinforce_loss.item(),
         "ce_loss": ce_loss_val,
         "mean_reward": mean_reward,
@@ -1087,6 +1118,11 @@ def train(args: argparse.Namespace) -> None:
                 "Enabled torch.compile for generator "
                 f"(mode={compile_mode}, fullgraph={args.compile_fullgraph})"
             )
+
+            if args.compile_fullgraph:
+                global _train_kernel
+                _train_kernel = torch.compile(_train_kernel, fullgraph=True)
+                print("Enabled torch.compile for training kernel (fullgraph=True)")
         except Exception as exc:
             print(f"torch.compile unavailable for this setup; continuing without it: {exc}")
 

@@ -120,38 +120,40 @@ def compute_whitened_feature_matching_terms(
     # Σ_c = Q Λ Qᵀ  =>  (Σ_c^†)^1/2 = Q (Λ^†)^1/2 Qᵀ
     # NOTE: Since we apply (Σ_c^†)^1/2 to many vectors, we can just transform
     # everything into the whitened space.
-    try:
-        # torch.linalg.eigh is not implemented for BFloat16/Float16 on CUDA
-        orig_dtype = sigma.dtype
-        if sigma.device.type == "cuda" and orig_dtype in (torch.float16, torch.bfloat16):
-            sigma = sigma.to(torch.float32)
 
-        # Use symeig-like eigh for symmetric matrices
-        L, Q = torch.linalg.eigh(sigma)
+    # torch.linalg.eigh is not implemented for BFloat16/Float16 on CUDA
+    orig_dtype = sigma.dtype
+    is_cuda = sigma.device.type == "cuda"
+    if is_cuda and orig_dtype in (torch.float16, torch.bfloat16):
+        sigma_proc = sigma.to(torch.float32)
+    else:
+        sigma_proc = sigma
 
-        # Avoid division by zero/negative eigenvalues (numerical noise)
-        # L_inv_sqrt = 1 / sqrt(L) where L > eps
-        mask = L > eps
-        L_inv_sqrt = torch.zeros_like(L)
-        L_inv_sqrt[mask] = 1.0 / torch.sqrt(L[mask])
+    # Add a small diagonal jitter to ensure positive definiteness and avoid LinAlgError
+    # This is graph-safe and replaces the need for try-except blocks.
+    jitter = eps * torch.eye(d, device=sigma.device, dtype=sigma_proc.dtype)
+    sigma_proc = sigma_proc + jitter
 
-        # Whitening matrix W = Q diag(L_inv_sqrt) Qᵀ
-        # (d, d) @ (d, d) @ (d, d) -> (d, d)
-        whitening_matrix = (Q * L_inv_sqrt) @ Q.T
+    # Use symeig-like eigh for symmetric matrices
+    L, Q = torch.linalg.eigh(sigma_proc)
 
-        # Transform features in Float32 for maximum precision
-        # (n, d) @ (d, d) -> (n, d)
-        rollout_features_w = rollout_features.to(torch.float32) @ whitening_matrix
-        ref_feature_w = ref_feature.to(torch.float32) @ whitening_matrix
+    # Avoid division by zero/negative eigenvalues (numerical noise)
+    # L_inv_sqrt = 1 / sqrt(L) where L > eps
+    mask = L > eps
+    L_inv_sqrt = torch.where(mask, 1.0 / torch.sqrt(L), torch.zeros_like(L))
 
-        # Cast back to original precision AFTER transformation
-        rollout_features_w = rollout_features_w.to(orig_dtype)
-        ref_feature_w = ref_feature_w.to(orig_dtype)
+    # Whitening matrix W = Q diag(L_inv_sqrt) Qᵀ
+    # (d, d) @ (d, d) @ (d, d) -> (d, d)
+    whitening_matrix = (Q * L_inv_sqrt) @ Q.T
 
-    except torch.linalg.LinAlgError:
-        # Fallback to unwhitened if decomposition fails
-        rollout_features_w = rollout_features
-        ref_feature_w = ref_feature
+    # Transform features in Float32 for maximum precision
+    # (n, d) @ (d, d) -> (n, d)
+    rollout_features_w = rollout_features.to(sigma_proc.dtype) @ whitening_matrix
+    ref_feature_w = ref_feature.to(sigma_proc.dtype) @ whitening_matrix
+
+    # Cast back to original precision AFTER transformation
+    rollout_features_w = rollout_features_w.to(orig_dtype)
+    ref_feature_w = ref_feature_w.to(orig_dtype)
 
     # 3. Alignment term (normalized): 2 * (phi_tilde_j / ||phi_tilde_j||) · (phi_tilde_y / ||phi_tilde_y||)
     # Norms (n,) and scalar
@@ -336,43 +338,42 @@ def compute_whitened_feature_matching_terms_batched(
     sigma = torch.bmm(rf.transpose(1, 2), rf) / n
 
     # 2. Compute whitened features: φ̃ = (Σ_c^†)^1/2 φ
-    try:
-        # torch.linalg.eigh is not implemented for BFloat16/Float16 on CUDA
-        orig_dtype = sigma.dtype
-        if (
-            sigma.device.type == "cuda"
-            and orig_dtype in (torch.float16, torch.bfloat16)
-        ):
-            sigma = sigma.to(torch.float32)
+    # torch.linalg.eigh is not implemented for BFloat16/Float16 on CUDA
+    orig_dtype = sigma.dtype
+    is_cuda = sigma.device.type == "cuda"
+    if is_cuda and orig_dtype in (torch.float16, torch.bfloat16):
+        sigma_proc = sigma.to(torch.float32)
+    else:
+        sigma_proc = sigma
 
-        # Batch eigen-decomposition
-        L, Q = torch.linalg.eigh(sigma)
+    # Add a small diagonal jitter to ensure positive definiteness and avoid LinAlgError
+    # This is graph-safe and replaces the need for try-except blocks.
+    jitter = eps * torch.eye(d, device=sigma.device, dtype=sigma_proc.dtype).unsqueeze(0)
+    sigma_proc = sigma_proc + jitter
 
-        # L: (B, D), Q: (B, D, D)
-        mask = L > eps
-        L_inv_sqrt = torch.zeros_like(L)
-        L_inv_sqrt[mask] = 1.0 / torch.sqrt(L[mask])
+    # Batch eigen-decomposition
+    L, Q = torch.linalg.eigh(sigma_proc)
 
-        # Whitening matrix W = Q diag(L_inv_sqrt) Qᵀ in FP32
-        # ((B, D, D) * (B, 1, D) (B, D, D) -> (B, D, D)
-        whitening_matrix = (Q * L_inv_sqrt.unsqueeze(1)) @ Q.transpose(1, 2)
+    # L: (B, D), Q: (B, D, D)
+    mask = L > eps
+    L_inv_sqrt = torch.where(mask, 1.0 / torch.sqrt(L), torch.zeros_like(L))
 
-        # Transform features in FP32
-        # rf_w: (B, n, D) @ (B, D, D) -> (B, n, D)
-        rf_w = torch.bmm(rf.to(torch.float32), whitening_matrix)
+    # Whitening matrix W = Q diag(L_inv_sqrt) Qᵀ in FP32
+    # ((B, D, D) * (B, 1, D) (B, D, D) -> (B, D, D)
+    whitening_matrix = (Q * L_inv_sqrt.unsqueeze(1)) @ Q.transpose(1, 2)
 
-        # ref_features_w: (B, 1, D) @ (B, D, D) -> (B, 1, D) -> (B, D)
-        ref_features_w = torch.bmm(ref_features.to(torch.float32).unsqueeze(1), whitening_matrix).squeeze(
-            1
-        )
+    # Transform features in FP32
+    # rf_w: (B, n, D) @ (B, D, D) -> (B, n, D)
+    rf_w = torch.bmm(rf.to(sigma_proc.dtype), whitening_matrix)
 
-        # Cast back to original precision AFTER transformation
-        rf_w = rf_w.to(orig_dtype)
-        ref_features_w = ref_features_w.to(orig_dtype)
+    # ref_features_w: (B, 1, D) @ (B, D, D) -> (B, 1, D) -> (B, D)
+    ref_features_w = torch.bmm(
+        ref_features.to(sigma_proc.dtype).unsqueeze(1), whitening_matrix
+    ).squeeze(1)
 
-    except torch.linalg.LinAlgError:
-        rf_w = rf
-        ref_features_w = ref_features
+    # Cast back to original precision AFTER transformation
+    rf_w = rf_w.to(orig_dtype)
+    ref_features_w = ref_features_w.to(orig_dtype)
 
     # 3. Alignment term (normalized): 2 * (phi_tilde_j / ||phi_tilde_j||) · (phi_tilde_y / ||phi_tilde_y||)
     # rollout_norms: (B, n), ref_norms: (B,)
