@@ -307,6 +307,7 @@ def compute_feature_matching_terms_batched(
     return alignment.reshape(total), diversity.reshape(total)
 
 
+@torch.compiler.disable
 def compute_whitened_feature_matching_terms_batched(
     rollout_features: torch.Tensor,
     ref_features: torch.Tensor,

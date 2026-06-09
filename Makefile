@@ -1,54 +1,7 @@
+PYTHON = /home/natekimball/Projects/EBP/ENV/bin/python
+
 train:
-	python train.py \
-		--model_type online \
-		--dataset_name data/Nemotron-CC-Math-v1_4plus \
-		--tokenized \
-		--context_length 1024 \
-		--generation_length 32 \
-		--num_rollouts 16 \
-		--batch_size 16 \
-		--dtype float16 \
-		--gradient_checkpointing \
-		--log_steps 1_000 \
-		--save_steps 10_000 \
-		--max_steps 1_000_000 \
-		--gradient_checkpointing \
-		--use_fused_adamw \
-		--use_flash_attention \
-		--compile_model \
-		--memory_constrained \
-		--num_workers 4 \
-		--val_split test \
-		--val_steps 1000 \
-		--max_val_batches 100
-
-small:
-	python train.py \
-		--model_type "online" \
-		--dataset_name data/Nemotron-CC-Math-v1_4plus \
-		--tokenized \
-		--generation_length 4 \
-		--num_rollouts 2 \
-		--batch_size 2 \
-		--gradient_checkpointing \
-		--max_steps 10 \
-		--output_dir "test_output" \
-		--pin_memory \
-		--num_workers 4 \
-		--persistent_workers \
-		--prefetch_factor 2 \
-		--use_fused_adamw \
-		--use_flash_attention \
-		--compile_model \
-
-
-
-# 		--memory_constrained
-
-# --pin_memory --num_workers 4 --persistent_workers --prefetch_factor 2
-
-test:
-	python train.py \
+	$(PYTHON) train.py \
 		--model_type online \
 		--dataset_name data/Nemotron-CC-Math-v1_4plus \
 		--tokenized \
@@ -99,6 +52,34 @@ cpt:
 		--wandb_run_name CPT \
 		--output_dir cpt_output
 
+small:
+	$(PYTHON) train.py \
+		--model_type "online" \
+		--dataset_name data/Nemotron-CC-Math-v1_4plus \
+		--tokenized \
+		--generation_length 4 \
+		--num_rollouts 2 \
+		--batch_size 2 \
+		--gradient_checkpointing \
+		--log_steps 10 \
+		--save_steps 10_000 \
+		--max_steps 1000 \
+		--pin_memory \
+		--num_workers 4 \
+		--persistent_workers \
+		--prefetch_factor 2 \
+		--use_fused_adamw \
+		--use_flash_attention \
+		--compile_model \
+		--compile_fullgraph \
+		--wandb_run_name "Test_Run" \
+		--output_dir "test_output"
+
+
+
+# 		--memory_constrained
+
+# --pin_memory --num_workers 4 --persistent_workers --prefetch_factor 2
 
 # 		--dtype float16 \
 

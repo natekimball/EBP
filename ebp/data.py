@@ -109,15 +109,21 @@ class PretrainingDataset(IterableDataset):
         # Auto-detect if loading from local disk
         self.is_cached = os.path.isdir(dataset_name)
 
+        # Load dataset metadata once in __init__ to avoid redundant I/O in workers
+        if self.is_cached:
+            self.raw_dataset = load_from_disk(self.dataset_name)
+            # If a split is specified and it's a DatasetDict, pick it
+            from datasets import DatasetDict
+            if isinstance(self.raw_dataset, DatasetDict) and self.split in self.raw_dataset:
+                self.raw_dataset = self.raw_dataset[self.split]
+        else:
+            self.raw_dataset = None  # Will load in __iter__ for streaming
+
     def __iter__(self) -> Iterator[Dict[str, List[int]]]:
         worker_info = get_worker_info()
 
         if self.is_cached:
-            raw = load_from_disk(self.dataset_name)
-            # If a split is specified and it's a DatasetDict, pick it
-            from datasets import DatasetDict
-            if isinstance(raw, DatasetDict) and self.split in raw:
-                raw = raw[self.split]
+            raw = self.raw_dataset
         else:
             raw = load_dataset(
                 self.dataset_name,

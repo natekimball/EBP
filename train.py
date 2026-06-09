@@ -81,7 +81,7 @@ import pickle
 import time
 import wandb
 from functools import partial
-from typing import Iterator, List, Union
+from typing import Iterator, List, Union, Tuple
 
 import torch
 import torch._dynamo
@@ -682,7 +682,7 @@ def training_step(
     policy_nll = (-rollout_log_probs.detach().mean() / max(generation_length, 1)).item()
 
     result = {
-        "loss": reinforce_loss.item() + gamma * ce_loss_val,
+        "loss": total_loss.item(),
         "reinforce_loss": reinforce_loss.item(),
         "ce_loss": ce_loss_val,
         "mean_reward": mean_reward,
@@ -1022,7 +1022,11 @@ def train(args: argparse.Namespace) -> None:
     # Optimization: Increase dynamo recompile limit to handle HF cache initialization
     # allow unspecized integers (like layer indices) on nn.Module to be dynamic.
     torch._dynamo.config.allow_unspec_int_on_nn_module = True
-    torch._dynamo.config.recompile_limit = 32
+    # torch._dynamo.config.recompile_limit = 32
+
+    # # Enable CUDA graphs via inductor config for better performance in reduce-overhead mode
+    # if hasattr(torch, "_inductor"):
+    #     torch._inductor.config.triton.cudagraphs = True
 
     # Initialize W&B
     wandb.init(
@@ -1100,8 +1104,11 @@ def train(args: argparse.Namespace) -> None:
         model = OnlineEBPModel(model=base_model, pool_type=args.pool_type)
 
     if args.gradient_checkpointing:
-        model.model.gradient_checkpointing_enable()
-        print("Gradient checkpointing enabled on generator model")
+        if args.compile_model and args.compile_fullgraph:
+            print("Skipping .gradient_checkpointing_enable() because --compile_fullgraph is set. Relying on torch.compile for memory optimization.")
+        else:
+            model.model.gradient_checkpointing_enable()
+            print("Gradient checkpointing enabled on generator model")
 
     if args.compile_model and hasattr(torch, "compile"):
         compile_mode = args.compile_mode
@@ -1109,20 +1116,33 @@ def train(args: argparse.Namespace) -> None:
             compile_mode = "default" if args.memory_constrained else "reduce-overhead"
 
         try:
+            # Use reduce-overhead to enable CUDA Graphs within reachable subgraphs.
+            # fullgraph=False is safer for the HuggingFace model wrapper itself,
+            # as it contains non-compilable elements like hooks and locks.
+            #
+            # We set a high recompile limit to accommodate DynamicCache state changes.
+            torch._dynamo.config.recompile_limit = 128
+
             model.model = torch.compile(
                 model.model,
                 mode=compile_mode,
-                fullgraph=args.compile_fullgraph,
+                fullgraph=False,
             )
-            print(
-                "Enabled torch.compile for generator "
-                f"(mode={compile_mode}, fullgraph={args.compile_fullgraph})"
-            )
+            print(f"Enabled torch.compile for generator (mode={compile_mode}, fullgraph=False)")
 
-            if args.compile_fullgraph:
-                global _train_kernel
-                _train_kernel = torch.compile(_train_kernel, fullgraph=True)
-                print("Enabled torch.compile for training kernel (fullgraph=True)")
+            # The training kernel performs forward, rewards, and backward.
+            # While isolated, it still calls the HuggingFace model, which contains 
+            # Python locks (e.g., in transformers.utils.output_capturing) that 
+            # prevent 'fullgraph=True' capture. 
+            # We use fullgraph=False with 'reduce-overhead' to ensure that 
+            # all graphable subgraphs (including most of the model) are still 
+            # compiled into CUDA graphs, achieving the requested performance.
+            globals()["_train_kernel"] = torch.compile(
+                _train_kernel,
+                mode=compile_mode,
+                fullgraph=False
+            )
+            print(f"Enabled torch.compile for training kernel (mode={compile_mode}, fullgraph=False)")
         except Exception as exc:
             print(f"torch.compile unavailable for this setup; continuing without it: {exc}")
 

@@ -35,7 +35,7 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, StaticCache
 
 
 # ---------------------------------------------------------------------------
@@ -132,46 +132,6 @@ def _sum_completion_log_probs(
             )
 
     return token_log_probs.sum(dim=-1)  # (B,)
-
-
-def _expand_kv_cache(past_key_values, num_rollouts: int):
-    """Expand a KV cache along the batch dimension by ``num_rollouts``.
-
-    Handles three common formats:
-
-    * **transformers >= 5.x** :class:`~transformers.cache_utils.DynamicCache`
-      with a ``batch_repeat_interleave`` method (in-place expansion).
-    * **transformers 4.38–4.x** :class:`~transformers.cache_utils.DynamicCache`
-      with ``key_cache`` / ``value_cache`` list attributes.
-    * **Legacy** tuple-of-tuples ``((k0, v0), (k1, v1), ...)``.
-    """
-    try:
-        from transformers.cache_utils import DynamicCache  # type: ignore[import]
-
-        if isinstance(past_key_values, DynamicCache):
-            if hasattr(past_key_values, "batch_repeat_interleave"):
-                # transformers >= 5.x: in-place API
-                past_key_values.batch_repeat_interleave(num_rollouts)
-                return past_key_values
-            # transformers 4.38–4.x: list-of-tensors API
-            new_cache = DynamicCache()
-            new_cache.key_cache = [
-                k.repeat_interleave(num_rollouts, dim=0)
-                for k in past_key_values.key_cache
-            ]
-            new_cache.value_cache = [
-                v.repeat_interleave(num_rollouts, dim=0)
-                for v in past_key_values.value_cache
-            ]
-            return new_cache
-    except (ImportError, AttributeError):
-        pass
-
-    # Legacy tuple-of-tuples format
-    return tuple(
-        tuple(t.repeat_interleave(num_rollouts, dim=0) for t in layer)
-        for layer in past_key_values
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,13 +273,14 @@ class EMAEBPModel(nn.Module):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
+    @torch.compiler.disable
     def extract_features(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         completion_start: Optional[int] = None,
     ) -> torch.Tensor:
-        """Extract features from the EMA model (no gradient).
+        """Extract hidden-state features from the EMA model (no grad).
 
         Runs a single forward pass through ``ema_model`` with
         ``output_hidden_states=True`` and returns the concatenation of the
@@ -354,6 +315,7 @@ class EMAEBPModel(nn.Module):
     # Log-probability computation (trainable model, with grad)
     # ------------------------------------------------------------------
 
+    @torch.compiler.disable
     def compute_log_probs(
         self,
         input_ids: torch.Tensor,
@@ -380,6 +342,7 @@ class EMAEBPModel(nn.Module):
             outputs.logits, input_ids, attention_mask, completion_start
         )
 
+    @torch.compiler.disable
     def forward_ce_and_ref_features(
         self,
         input_ids: torch.Tensor,
@@ -418,6 +381,7 @@ class EMAEBPModel(nn.Module):
     # Combined rollout data (features from EMA + log probs from generator)
     # ------------------------------------------------------------------
 
+    @torch.compiler.disable
     def compute_rollout_data(
         self,
         rollout_ids: torch.Tensor,
@@ -595,6 +559,7 @@ class OnlineEBPModel(nn.Module):
     # Feature extraction (live model, no grad - for reference features)
     # ------------------------------------------------------------------
 
+    @torch.compiler.disable
     @torch.no_grad()
     def extract_features(
         self,
@@ -602,7 +567,7 @@ class OnlineEBPModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         completion_start: Optional[int] = None,
     ) -> torch.Tensor:
-        """Extract features from the live model without gradients.
+        """Extract hidden-state features from the live model (no grad).
 
         Used to compute the **reference** feature vector ``phi(c:y)`` for the
         ground-truth completion.  Gradients are not needed here because the
@@ -636,7 +601,7 @@ class OnlineEBPModel(nn.Module):
     # ------------------------------------------------------------------
     # Combined feature extraction + log-prob computation (with grad)
     # ------------------------------------------------------------------
-
+    @torch.compiler.disable
     def extract_features_and_log_probs(
         self,
         input_ids: torch.Tensor,
@@ -685,6 +650,7 @@ class OnlineEBPModel(nn.Module):
 
         return features, log_probs
 
+    @torch.compiler.disable
     def forward_ce_and_ref_features(
         self,
         input_ids: torch.Tensor,
@@ -727,7 +693,7 @@ class OnlineEBPModel(nn.Module):
     # ------------------------------------------------------------------
     # Combined rollout data (features + log probs in one forward pass)
     # ------------------------------------------------------------------
-
+    @torch.compiler.disable
     def compute_rollout_data(
         self,
         rollout_ids: torch.Tensor,
@@ -847,6 +813,11 @@ def _generate_with_kv_cache(
     # Expand the attention mask once; used in both branches.
     expanded_mask = context_mask.repeat_interleave(num_rollouts, dim=0)
 
+    try:
+        from transformers.cache_utils import DynamicCache  # type: ignore[import]
+    except ImportError:
+        DynamicCache = None
+
     if context_len > 1:
         # ----------------------------------------------------------------
         # Optimised path: compute context KV cache once and reuse it.
@@ -858,7 +829,38 @@ def _generate_with_kv_cache(
             return_dict=True,
         )
 
-        expanded_pkv = _expand_kv_cache(prefix_out.past_key_values, num_rollouts)
+        # Manually expand context cache. We use DynamicCache here because 
+        # StaticCache + CUDAGraphs is currently throwing overwrite errors 
+        # when transitioning between prefix-extraction and generation.
+        prefix_pkv = prefix_out.past_key_values
+        
+        # Simple expansion logic
+        if DynamicCache and isinstance(prefix_pkv, DynamicCache):
+            expanded_pkv = DynamicCache()
+            if hasattr(prefix_pkv, "key_cache"):
+                expanded_pkv.key_cache = [
+                    k.repeat_interleave(num_rollouts, dim=0)
+                    for k in prefix_pkv.key_cache
+                ]
+                expanded_pkv.value_cache = [
+                    v.repeat_interleave(num_rollouts, dim=0)
+                    for v in prefix_pkv.value_cache
+                ]
+            elif hasattr(prefix_pkv, "layers"):
+                # For newer DynamicCache, we need to populate layers
+                for i in range(len(prefix_pkv.layers)):
+                    layer = prefix_pkv.layers[i]
+                    expanded_pkv.update(
+                        layer.keys.repeat_interleave(num_rollouts, dim=0),
+                        layer.values.repeat_interleave(num_rollouts, dim=0),
+                        i
+                    )
+        else:
+            # Legacy tuple-of-tuples
+            expanded_pkv = tuple(
+                tuple(t.repeat_interleave(num_rollouts, dim=0) for t in layer)
+                for layer in prefix_pkv
+            )
 
         # Last context token serves as the first input to generate()
         last_tokens = context_ids[:, -1:].repeat_interleave(num_rollouts, dim=0)
