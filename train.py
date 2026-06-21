@@ -1119,10 +1119,6 @@ def train(args: argparse.Namespace) -> None:
             # Use reduce-overhead to enable CUDA Graphs within reachable subgraphs.
             # fullgraph=False is safer for the HuggingFace model wrapper itself,
             # as it contains non-compilable elements like hooks and locks.
-            #
-            # We set a high recompile limit to accommodate DynamicCache state changes.
-            torch._dynamo.config.recompile_limit = 128
-
             model.model = torch.compile(
                 model.model,
                 mode=compile_mode,

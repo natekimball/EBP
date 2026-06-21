@@ -22,9 +22,9 @@ Both classes expose a common :meth:`compute_rollout_data` interface that
 returns ``(rollout_features, rollout_log_probs)`` so that :mod:`train` does
 not need to branch on the model type.
 
-Both classes also optimise rollout generation by pre-computing a prefix KV
-cache once per batch item and reusing it across all ``num_rollouts`` for that
-item, avoiding redundant context re-computation.
+Both classes also optimise rollout generation via :class:`StaticCache`, which
+pre-allocates fixed-shape KV tensors so generation stays O(1) per token and
+CUDA graph capture inside ``generate()`` remains possible under compilation.
 """
 
 from __future__ import annotations
@@ -203,9 +203,8 @@ class EMAEBPModel(nn.Module):
     or mean), then L2-normalised per layer, and finally concatenated into a
     single feature vector.
 
-    Rollout generation uses a **prefix KV cache**: the KV cache is computed
-    once for each batch item's context and reused across all ``num_rollouts``
-    for that item, avoiding redundant context re-computation.
+    Rollout generation uses :class:`StaticCache` for O(1) per-token cost and
+    stable tensor shapes compatible with CUDA graph capture under compilation.
 
     Args:
         model_name: HuggingFace model identifier (default: ``"Qwen/Qwen3-0.6B"``).
@@ -408,7 +407,7 @@ class EMAEBPModel(nn.Module):
         return features, log_probs
 
     # ------------------------------------------------------------------
-    # Rollout generation with prefix KV cache (no grad)
+    # Rollout generation (StaticCache, no grad)
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -419,35 +418,76 @@ class EMAEBPModel(nn.Module):
         num_rollouts: int,
         generation_length: int,
         temperature: float = 1.0,
+        use_cache: bool = True,
         **generate_kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sample ``num_rollouts`` completions of length ``generation_length``.
 
-        The context prefix KV cache is computed **once per batch item** and
-        then expanded for ``num_rollouts``, avoiding redundant re-computation
-        of the context for each rollout.
-
         Args:
             context_ids: ``(B, context_len)`` context token ids.
             context_attention_mask: ``(B, context_len)`` binary mask.
-            num_rollouts: Number of completions to sample per context.
+            num_rollouts: Number of completions per context.
             generation_length: Number of new tokens to generate.
             temperature: Sampling temperature.
+            use_cache: If True, uses StaticCache for speed and stability.
             **generate_kwargs: Extra keyword arguments for ``model.generate``.
 
         Returns:
             rollout_ids:   ``(B * num_rollouts, context_len + generation_length)``
             rollout_masks: ``(B * num_rollouts, context_len + generation_length)``
         """
-        return _generate_with_kv_cache(
-            self.model,
-            context_ids,
-            context_attention_mask,
-            num_rollouts,
-            generation_length,
-            temperature,
-            **generate_kwargs,
+        # Expand context per rollout
+        expanded_ids = context_ids.repeat_interleave(num_rollouts, dim=0)
+        expanded_mask = context_attention_mask.repeat_interleave(num_rollouts, dim=0)
+
+        context_len = context_ids.shape[1]
+
+        if use_cache:
+            # StaticCache pre-allocates fixed-shape KV tensors, enabling CUDA graph
+            # capture inside generate() and O(1) per-token cost instead of O(N^2).
+            batch_size = expanded_ids.shape[0]
+            max_length = context_len + generation_length
+
+            pkv = StaticCache(
+                config=self.model.config,
+                batch_size=batch_size,
+                max_cache_len=max_length,
+                device=self.model.device,
+                dtype=self.model.dtype,
+            )
+
+            output_ids = self.model.generate(
+                input_ids=expanded_ids,
+                attention_mask=expanded_mask,
+                max_new_tokens=generation_length,
+                do_sample=True,
+                temperature=temperature,
+                past_key_values=pkv,
+                use_cache=True,
+                pad_token_id=self.model.config.eos_token_id,
+                **generate_kwargs,
+            )
+        else:
+            # Fallback: O(N^2) generation without cache.
+            output_ids = self.model.generate(
+                input_ids=expanded_ids,
+                attention_mask=expanded_mask,
+                max_new_tokens=generation_length,
+                do_sample=True,
+                temperature=temperature,
+                use_cache=False,
+                pad_token_id=self.model.config.eos_token_id,
+                **generate_kwargs,
+            )
+
+        # Build attention mask for the full (context + generated) sequences
+        gen_len = output_ids.shape[1] - context_len
+        new_mask = torch.ones(
+            output_ids.shape[0], gen_len, dtype=torch.long, device=output_ids.device
         )
+        rollout_masks = torch.cat([expanded_mask, new_mask], dim=1)
+
+        return output_ids, rollout_masks
 
     # ------------------------------------------------------------------
     # EMA update (stop-gradient)
@@ -730,11 +770,10 @@ class OnlineEBPModel(nn.Module):
         num_rollouts: int,
         generation_length: int,
         temperature: float = 1.0,
+        use_cache: bool = True,
         **generate_kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sample ``num_rollouts`` completions of length ``generation_length``.
-
-        Uses prefix KV caching identical to :class:`EMAEBPModel`.
 
         Args:
             context_ids: ``(B, context_len)`` context token ids.
@@ -742,170 +781,63 @@ class OnlineEBPModel(nn.Module):
             num_rollouts: Number of completions per context.
             generation_length: Number of new tokens to generate.
             temperature: Sampling temperature.
+            use_cache: If True, uses StaticCache for speed and stability.
             **generate_kwargs: Extra keyword arguments for ``model.generate``.
 
         Returns:
             rollout_ids:   ``(B * num_rollouts, context_len + generation_length)``
             rollout_masks: ``(B * num_rollouts, context_len + generation_length)``
         """
-        return _generate_with_kv_cache(
-            self.model,
-            context_ids,
-            context_attention_mask,
-            num_rollouts,
-            generation_length,
-            temperature,
-            **generate_kwargs,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Shared rollout generation with prefix KV cache
-# ---------------------------------------------------------------------------
-
-
-@torch.no_grad()
-def _generate_with_kv_cache(
-    model: nn.Module,
-    context_ids: torch.Tensor,
-    context_mask: torch.Tensor,
-    num_rollouts: int,
-    generation_length: int,
-    temperature: float = 1.0,
-    **generate_kwargs,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate rollouts reusing a shared prefix KV cache.
-
-    The context prefix KV cache is computed **once per batch item** and then
-    replicated ``num_rollouts`` times, so the context self-attention is
-    computed only once regardless of how many rollouts are requested.
-
-    When ``context_len <= 1`` (degenerate case), falls back to the naive
-    approach (no prefix caching).
-
-    Implementation details:
-
-    1. Run a forward pass on ``context_ids[:, :-1]`` to populate the KV cache
-       for positions ``0 ... context_len - 2``.
-    2. Replicate the cache ``num_rollouts`` times along the batch dimension.
-    3. Call ``model.generate()`` with ``input_ids = context_ids[:, -1:]``
-       (the last context token) and ``past_key_values = expanded_cache``.
-       Generation then starts at position ``context_len - 1`` and produces
-       ``generation_length`` new tokens.
-    4. Reconstruct the full ``(B * n, context_len + generation_length)``
-       sequences by prepending the original context.
-
-    Args:
-        model: The causal LM whose ``generate`` method will be called.
-        context_ids: ``(B, context_len)``
-        context_mask: ``(B, context_len)``
-        num_rollouts: Rollouts per context item.
-        generation_length: Tokens to generate per rollout.
-        temperature: Sampling temperature.
-        **generate_kwargs: Forwarded to ``model.generate``.
-
-    Returns:
-        full_ids:      ``(B * num_rollouts, context_len + generation_length)``
-        rollout_masks: ``(B * num_rollouts, context_len + generation_length)``
-    """
-    context_len = context_ids.shape[1]
-
-    # Expand the attention mask once; used in both branches.
-    expanded_mask = context_mask.repeat_interleave(num_rollouts, dim=0)
-
-    try:
-        from transformers.cache_utils import DynamicCache  # type: ignore[import]
-    except ImportError:
-        DynamicCache = None
-
-    if context_len > 1:
-        # ----------------------------------------------------------------
-        # Optimised path: compute context KV cache once and reuse it.
-        # ----------------------------------------------------------------
-        prefix_out = model(
-            input_ids=context_ids[:, :-1],
-            attention_mask=context_mask[:, :-1],
-            use_cache=True,
-            return_dict=True,
-        )
-
-        # Manually expand context cache. We use DynamicCache here because 
-        # StaticCache + CUDAGraphs is currently throwing overwrite errors 
-        # when transitioning between prefix-extraction and generation.
-        prefix_pkv = prefix_out.past_key_values
+        # Expand context per rollout
+        expanded_ids = context_ids.repeat_interleave(num_rollouts, dim=0)
+        expanded_mask = context_attention_mask.repeat_interleave(num_rollouts, dim=0)
         
-        # Simple expansion logic
-        if DynamicCache and isinstance(prefix_pkv, DynamicCache):
-            expanded_pkv = DynamicCache()
-            if hasattr(prefix_pkv, "key_cache"):
-                expanded_pkv.key_cache = [
-                    k.repeat_interleave(num_rollouts, dim=0)
-                    for k in prefix_pkv.key_cache
-                ]
-                expanded_pkv.value_cache = [
-                    v.repeat_interleave(num_rollouts, dim=0)
-                    for v in prefix_pkv.value_cache
-                ]
-            elif hasattr(prefix_pkv, "layers"):
-                # For newer DynamicCache, we need to populate layers
-                for i in range(len(prefix_pkv.layers)):
-                    layer = prefix_pkv.layers[i]
-                    expanded_pkv.update(
-                        layer.keys.repeat_interleave(num_rollouts, dim=0),
-                        layer.values.repeat_interleave(num_rollouts, dim=0),
-                        i
-                    )
+        context_len = context_ids.shape[1]
+        
+        if use_cache:
+            # use_cache=True uses StaticCache to ensure static shapes for the compiler 
+            # while maintaining O(1) per-token generation speed.
+            batch_size = expanded_ids.shape[0]
+            max_length = context_len + generation_length
+            
+            pkv = StaticCache(
+                config=self.model.config,
+                batch_size=batch_size,
+                max_cache_len=max_length,
+                device=self.model.device,
+                dtype=self.model.dtype,
+            )
+            
+            output_ids = self.model.generate(
+                input_ids=expanded_ids,
+                attention_mask=expanded_mask,
+                max_new_tokens=generation_length,
+                do_sample=True,
+                temperature=temperature,
+                past_key_values=pkv,
+                use_cache=True,
+                pad_token_id=self.model.config.eos_token_id,
+                **generate_kwargs,
+            )
         else:
-            # Legacy tuple-of-tuples
-            expanded_pkv = tuple(
-                tuple(t.repeat_interleave(num_rollouts, dim=0) for t in layer)
-                for layer in prefix_pkv
+            # Fallback to O(N^2) generation without cache for absolute shape stability
+            # if StaticCache is not desired.
+            output_ids = self.model.generate(
+                input_ids=expanded_ids,
+                attention_mask=expanded_mask,
+                max_new_tokens=generation_length,
+                do_sample=True,
+                temperature=temperature,
+                use_cache=False,
+                pad_token_id=self.model.config.eos_token_id,
+                **generate_kwargs,
             )
 
-        # Last context token serves as the first input to generate()
-        last_tokens = context_ids[:, -1:].repeat_interleave(num_rollouts, dim=0)
-
-        output_ids = model.generate(
-            input_ids=last_tokens,
-            attention_mask=expanded_mask,
-            past_key_values=expanded_pkv,
-            max_new_tokens=generation_length,
-            do_sample=True,
-            temperature=temperature,
-            use_cache=True,
-            pad_token_id=model.config.eos_token_id,
-            **generate_kwargs,
+        # Build attention mask for the full (context + generated) sequences
+        gen_len = output_ids.shape[1] - context_len
+        new_mask = torch.ones(
+            output_ids.shape[0], gen_len, dtype=torch.long, device=output_ids.device
         )
-        # output_ids: (B*n, 1 + generation_length)
-        # output_ids[:, 0] is the last context token; drop it and prepend
-        # the full context to reconstruct the complete sequences.
-        context_expanded = context_ids.repeat_interleave(num_rollouts, dim=0)
-        gen_tokens = output_ids[:, 1:]  # (B*n, generation_length)
-        full_ids = torch.cat([context_expanded, gen_tokens], dim=1)
+        rollout_masks = torch.cat([expanded_mask, new_mask], dim=1)
 
-    else:
-        # ----------------------------------------------------------------
-        # Fallback: standard generate (no prefix to cache).
-        # ----------------------------------------------------------------
-        expanded_ids = context_ids.repeat_interleave(num_rollouts, dim=0)
-
-        output_ids = model.generate(
-            input_ids=expanded_ids,
-            attention_mask=expanded_mask,
-            max_new_tokens=generation_length,
-            do_sample=True,
-            temperature=temperature,
-            use_cache=True,
-            pad_token_id=model.config.eos_token_id,
-            **generate_kwargs,
-        )
-        full_ids = output_ids
-
-    # Build attention mask for the full (context + generated) sequences
-    gen_len = full_ids.shape[1] - context_len
-    new_mask = torch.ones(
-        full_ids.shape[0], gen_len, dtype=torch.long, device=full_ids.device
-    )
-    rollout_masks = torch.cat([expanded_mask, new_mask], dim=1)
-
-    return full_ids, rollout_masks
+        return output_ids, rollout_masks
