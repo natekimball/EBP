@@ -47,8 +47,8 @@ This repository includes several optimizations for large-scale pre-training on c
 ### Training Strategies
 EBP supports two main execution paths to balance throughput and memory:
 
-- **Standard (`--no-memory_constrained`)**: Uses `torch.compile(mode="reduce-overhead")` with CUDA Graphs. This offers the highest throughput (~6% faster) but has a higher "Reserved VRAM" floor because graph buffers are pre-allocated.
-- **Memory-Constrained (`--memory_constrained`)**: Automatically used as the default. It performs the Cross-Entropy backward pass *before* rollout generation, allowing the GPU to reuse activation buffers. This reduces peak reserved VRAM by ~30% for small models like Qwen3-0.6B.
+- **Standard (default)**: Uses `torch.compile(mode="reduce-overhead")` with CUDA Graphs for maximum throughput. Graph buffers are pre-allocated, so reserved VRAM is higher.
+- **Memory-Constrained (`--memory_constrained`)**: Splits the backward pass — CE is backpropagated *before* rollout generation so the activation buffers can be reused. Reduces peak reserved VRAM by ~30% but **disables CUDA Graph capture** (compile mode falls back to `"default"`), so throughput is lower. Use only if the standard path OOMs.
 
 See [benchmark_report.md](benchmark_report.md) for a detailed comparison of VRAM utilization and iteration speeds.
 
@@ -141,7 +141,7 @@ python benchmark.py --model_type online --gamma 0.1 --batch_size 4
 | :--- | :--- | :--- |
 | `--model_name` | `Qwen/Qwen3-0.6B` | HuggingFace model identifier. |
 | `--model_type` | `ema` | `ema` (dual network) or `online` (single network). |
-| `--memory_constrained` | `True` | Prioritize memory reuse over peak throughput (recommended). |
+| `--memory_constrained` | `false` | Split backward pass to cut peak VRAM ~30%; disables CUDA graphs. Use only if OOM. |
 | `--gamma` | `0.1` | Weight of the Cross-Entropy loss term. |
 | `--num_rollouts` | `4` | Number of completions sampled per context. |
 | `--generation_length` | `8` | Tokens generated per rollout. |
@@ -151,8 +151,10 @@ python benchmark.py --model_type online --gamma 0.1 --batch_size 4
 | `--dtype` | `auto` | `float32` / `bfloat16` / `float16` / `auto`. |
 | `--compile_model` | `false` | Compile generator with `torch.compile`. |
 | `--compile_mode` | `default` | `torch.compile` mode (`default` or `reduce-overhead`). |
-| `--whitening` | `false` | Use whitened feature matching (EBFT Eq. 9). |
+| `--whitening` | `true` | Use whitened feature matching (EBFT Eq. 9). |
 | `--use_fused_adamw` | `true` | Use fused CUDA AdamW kernels when available. |
+| `--warmup_steps` | `0` | Linear LR warmup steps before cosine decay. |
+| `--grad_accum_steps` | `1` | Gradient accumulation steps (effective batch = `batch_size × N`). |
 | `--use_flash_attention` | `true` | Request FlashAttention v2 on supported CUDA setups. |
 | `--pin_memory` | auto | Enable pinned host memory for faster GPU transfer. |
 | `--num_workers` | auto | DataLoader worker count. |

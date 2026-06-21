@@ -1,7 +1,11 @@
 """
 EBP Model variants.
 
-Two model classes are provided for experimentation:
+Three classes are provided:
+
+* :class:`BaseEBPModel` – shared base holding the trainable generator,
+  feature-layer configuration, and the :meth:`generate_rollouts` sampling
+  loop.  Not intended for direct use.
 
 * :class:`EMAEBPModel` – the **EMA** variant.  Maintains an Exponential
   Moving Average (EMA) copy of the generator.  The EMA model is used as a
@@ -18,13 +22,14 @@ Two model classes are provided for experimentation:
   the generator improves so do the features; the diversity term of the
   feature-matching reward prevents representational collapse.
 
-Both classes expose a common :meth:`compute_rollout_data` interface that
-returns ``(rollout_features, rollout_log_probs)`` so that :mod:`train` does
-not need to branch on the model type.
+Both concrete classes expose a common :meth:`compute_rollout_data` interface
+that returns ``(rollout_features, rollout_log_probs)`` so that :mod:`train`
+does not need to branch on the model type.
 
-Both classes also optimise rollout generation via :class:`StaticCache`, which
-pre-allocates fixed-shape KV tensors so generation stays O(1) per token and
-CUDA graph capture inside ``generate()`` remains possible under compilation.
+Rollout generation is shared via the base class and uses
+:class:`StaticCache`, which pre-allocates fixed-shape KV tensors so
+generation stays O(1) per token and CUDA graph capture inside ``generate()``
+remains possible under compilation.
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ from transformers import AutoModelForCausalLM, StaticCache
 
 
 # ---------------------------------------------------------------------------
-# Module-level helpers (shared between both model classes)
+# Module-level helpers
 # ---------------------------------------------------------------------------
 
 
@@ -62,7 +67,7 @@ def _pool_hidden_state(
     """
     if pool_type == "mean":
         if completion_start is not None:
-            comp_h = h[:, completion_start:, :]  # (B, comp_len, D)
+            comp_h = h[:, completion_start:, :]
             if attention_mask is not None:
                 mask = attention_mask[:, completion_start:].float().unsqueeze(-1)
                 pooled = (comp_h * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
@@ -74,17 +79,12 @@ def _pool_hidden_state(
         else:
             pooled = h.mean(dim=1)
     else:
-        # Default: last-token pooling
+        # last-token pooling
         if attention_mask is not None:
-            # Get index of the last non-masked token for each sequence
-            # (B, L) -> (B,)
             last_indices = attention_mask.sum(dim=1).long() - 1
-            # B-sized range: [0, 1, ..., B-1]
             batch_range = torch.arange(h.size(0), device=h.device)
-            # Gather (B, D)
             pooled = h[batch_range, last_indices]
         else:
-            # Fallback: physical last token
             pooled = h[:, -1, :]
 
     return F.normalize(pooled, p=2, dim=-1)
@@ -117,12 +117,11 @@ def _sum_completion_log_probs(
     ).squeeze(-1)  # (B, L-1)
 
     if completion_start is not None:
-        # After the left-shift, `token_log_probs[t]` is the log-prob of
-        # `input_ids[t+1]`.  To get the log-prob of the first completion
-        # token (at index `completion_start`) we therefore need index
-        # `completion_start - 1` in the shifted array.
+        # token_log_probs[t] is the log-prob of input_ids[t+1]; to get the
+        # log-prob of the first completion token (index completion_start) we
+        # need offset completion_start - 1 in the shifted array.
         start = max(0, completion_start - 1)
-        token_log_probs = token_log_probs[:, start:]  # (B, comp_len)
+        token_log_probs = token_log_probs[:, start:]
 
         if attention_mask is not None:
             comp_mask = attention_mask[:, completion_start:]
@@ -132,11 +131,6 @@ def _sum_completion_log_probs(
             )
 
     return token_log_probs.sum(dim=-1)  # (B,)
-
-
-# ---------------------------------------------------------------------------
-# Shared architecture helper
-# ---------------------------------------------------------------------------
 
 
 def _get_transformer_layers(model: nn.Module) -> nn.ModuleList:
@@ -184,35 +178,23 @@ def _features_from_hidden_states(
 
 
 # ---------------------------------------------------------------------------
-# EMAEBPModel
+# BaseEBPModel
 # ---------------------------------------------------------------------------
 
 
-class EMAEBPModel(nn.Module):
-    """Energy-Based Pre-training with an EMA feature network.
+class BaseEBPModel(nn.Module):
+    """Shared base for EMA and Online EBP model variants.
 
-    Holds two copies of a causal LM:
-
-    * ``model`` - the trainable generator ``p_theta``.
-    * ``ema_model`` - an Exponential Moving Average of ``model``, used as the
-      feature network ``phi``.  Updated via :meth:`update_ema` after every
-      gradient step; no gradient ever flows through it.
-
-    Feature extraction follows the EBFT paper: hidden states at layers placed
-    at depths ``feature_layer_fractions`` of the network are pooled (last-token
-    or mean), then L2-normalised per layer, and finally concatenated into a
-    single feature vector.
-
-    Rollout generation uses :class:`StaticCache` for O(1) per-token cost and
-    stable tensor shapes compatible with CUDA graph capture under compilation.
+    Holds the trainable generator and common configuration (feature-layer
+    fractions, pooling type).  Provides the :meth:`generate_rollouts` sampling
+    loop used by both subclasses.
 
     Args:
         model_name: HuggingFace model identifier (default: ``"Qwen/Qwen3-0.6B"``).
-        ema_decay: EMA decay factor (``ema <- decay*ema + (1-decay)*theta``).
         feature_layer_fractions: Relative depths at which to capture hidden
             states, e.g. ``(0.25, 0.50, 0.75)``.
-        pool_type: Pooling strategy for hidden-state features (default: ``"last"``,
-            or ``"mean"``).
+        pool_type: Pooling strategy for hidden-state features (``"last"`` or
+            ``"mean"``).
         model: Optional pre-instantiated model; if supplied, *model_name* is
             ignored.
     """
@@ -220,24 +202,16 @@ class EMAEBPModel(nn.Module):
     def __init__(
         self,
         model_name: str = "Qwen/Qwen3-0.6B",
-        ema_decay: float = 0.999,
         feature_layer_fractions: Sequence[float] = (0.25, 0.50, 0.75),
         pool_type: str = "last",
         model: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
 
-        if model is not None:
-            self.model: nn.Module = model
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(model_name)
-
-        # EMA copy - no gradients ever flow through this
-        self.ema_model: nn.Module = copy.deepcopy(self.model)
-        for param in self.ema_model.parameters():
-            param.requires_grad_(False)
-
-        self.ema_decay = ema_decay
+        self.model: nn.Module = (
+            model if model is not None
+            else AutoModelForCausalLM.from_pretrained(model_name)
+        )
         self.feature_layer_fractions = tuple(feature_layer_fractions)
         self.pool_type = pool_type
 
@@ -246,11 +220,6 @@ class EMAEBPModel(nn.Module):
             max(0, min(round(f * num_layers) - 1, num_layers - 1))
             for f in self.feature_layer_fractions
         ]
-        self._ema_layers = _get_transformer_layers(self.ema_model)
-
-    # ------------------------------------------------------------------
-    # Forward (trainable generator)
-    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -267,6 +236,113 @@ class EMAEBPModel(nn.Module):
             use_cache=use_cache,
         )
 
+    @torch.no_grad()
+    def generate_rollouts(
+        self,
+        context_ids: torch.Tensor,
+        context_attention_mask: torch.Tensor,
+        num_rollouts: int,
+        generation_length: int,
+        temperature: float = 1.0,
+        use_cache: bool = True,
+        **generate_kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample ``num_rollouts`` completions of length ``generation_length``.
+
+        Args:
+            context_ids: ``(B, context_len)`` context token ids.
+            context_attention_mask: ``(B, context_len)`` binary mask.
+            num_rollouts: Number of completions per context.
+            generation_length: Number of new tokens to generate.
+            temperature: Sampling temperature.
+            use_cache: If True, uses StaticCache for O(1) per-token cost and
+                stable tensor shapes compatible with CUDA graph capture.
+            **generate_kwargs: Extra keyword arguments for ``model.generate``.
+
+        Returns:
+            rollout_ids:   ``(B * num_rollouts, context_len + generation_length)``
+            rollout_masks: ``(B * num_rollouts, context_len + generation_length)``
+        """
+        expanded_ids = context_ids.repeat_interleave(num_rollouts, dim=0)
+        expanded_mask = context_attention_mask.repeat_interleave(num_rollouts, dim=0)
+        context_len = context_ids.shape[1]
+
+        generate_kwargs_common = dict(
+            input_ids=expanded_ids,
+            attention_mask=expanded_mask,
+            max_new_tokens=generation_length,
+            do_sample=True,
+            temperature=temperature,
+            pad_token_id=self.model.config.eos_token_id,
+            **generate_kwargs,
+        )
+
+        if use_cache:
+            pkv = StaticCache(
+                config=self.model.config,
+                batch_size=expanded_ids.shape[0],
+                max_cache_len=context_len + generation_length,
+                device=self.model.device,
+                dtype=self.model.dtype,
+            )
+            output_ids = self.model.generate(
+                **generate_kwargs_common, past_key_values=pkv, use_cache=True
+            )
+        else:
+            output_ids = self.model.generate(**generate_kwargs_common, use_cache=False)
+
+        gen_len = output_ids.shape[1] - context_len
+        new_mask = torch.ones(
+            output_ids.shape[0], gen_len, dtype=torch.long, device=output_ids.device
+        )
+        rollout_masks = torch.cat([expanded_mask, new_mask], dim=1)
+        return output_ids, rollout_masks
+
+
+# ---------------------------------------------------------------------------
+# EMAEBPModel
+# ---------------------------------------------------------------------------
+
+
+class EMAEBPModel(BaseEBPModel):
+    """Energy-Based Pre-training with an EMA feature network.
+
+    Extends :class:`BaseEBPModel` with an Exponential Moving Average copy of
+    the generator (``ema_model``) that serves as a stable, slowly-evolving
+    feature network.  No gradient ever flows through the EMA model.
+
+    Feature extraction follows the EBFT paper: hidden states at layers placed
+    at depths ``feature_layer_fractions`` of the network are pooled (last-token
+    or mean), then L2-normalised per layer, and finally concatenated into a
+    single feature vector.
+
+    Args:
+        model_name: HuggingFace model identifier (default: ``"Qwen/Qwen3-0.6B"``).
+        ema_decay: EMA decay factor (``ema <- decay*ema + (1-decay)*theta``).
+        feature_layer_fractions: Relative depths at which to capture hidden
+            states, e.g. ``(0.25, 0.50, 0.75)``.
+        pool_type: Pooling strategy for hidden-state features (default: ``"last"``).
+        model: Optional pre-instantiated model; if supplied, *model_name* is
+            ignored.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-0.6B",
+        ema_decay: float = 0.999,
+        feature_layer_fractions: Sequence[float] = (0.25, 0.50, 0.75),
+        pool_type: str = "last",
+        model: Optional[nn.Module] = None,
+    ) -> None:
+        super().__init__(model_name, feature_layer_fractions, pool_type, model)
+
+        self.ema_model: nn.Module = copy.deepcopy(self.model)
+        for param in self.ema_model.parameters():
+            param.requires_grad_(False)
+
+        self.ema_decay = ema_decay
+        self._ema_layers = _get_transformer_layers(self.ema_model)
+
     # ------------------------------------------------------------------
     # Feature extraction (EMA model, no grad)
     # ------------------------------------------------------------------
@@ -281,9 +357,9 @@ class EMAEBPModel(nn.Module):
     ) -> torch.Tensor:
         """Extract hidden-state features from the EMA model (no grad).
 
-        Runs a single forward pass through ``ema_model`` with
+        Runs a forward pass through ``ema_model`` with
         ``output_hidden_states=True`` and returns the concatenation of the
-        per-layer mean-pooled, L2-normalised hidden states.
+        per-layer pooled, L2-normalised hidden states.
 
         Args:
             input_ids: ``(B, L)`` token ids.
@@ -300,7 +376,6 @@ class EMAEBPModel(nn.Module):
             output_hidden_states=True,
             return_dict=True,
         )
-
         return _features_from_hidden_states(
             hidden_states=outputs.hidden_states,
             feature_layer_indices=self.feature_layer_indices,
@@ -308,7 +383,7 @@ class EMAEBPModel(nn.Module):
             completion_start=completion_start,
             detach=True,
             pool_type=self.pool_type,
-        )  # (B, D * K)
+        )
 
     # ------------------------------------------------------------------
     # Log-probability computation (trainable model, with grad)
@@ -329,8 +404,7 @@ class EMAEBPModel(nn.Module):
             completion_start: Index of the first completion token.
 
         Returns:
-            ``(B,)`` sum of per-token log-probabilities for the completion
-            (with gradients).
+            ``(B,)`` sum of per-token log-probabilities (with gradients).
         """
         outputs = self.model(
             input_ids=input_ids,
@@ -348,11 +422,10 @@ class EMAEBPModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         completion_start: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return CE loss and detached reference features for EMA variant.
+        """Return CE loss and detached reference features.
 
-        For :class:`EMAEBPModel`, this intentionally remains a two-forward
-        implementation: CE is computed on the trainable generator while
-        reference features are computed via ``ema_model``.
+        CE is computed on the trainable generator; reference features come
+        from the EMA model.
 
         Args:
             input_ids: ``(B, L)`` full sequence (context + completion).
@@ -389,9 +462,8 @@ class EMAEBPModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return features and log-probs for all rollouts.
 
-        Performs two forward passes: one through the EMA model for features
-        (no grad), and one through the trainable generator for log-probs
-        (with grad).  Both passes process all ``B * n`` rollouts at once.
+        Two forward passes: EMA model for features (no grad), generator for
+        log-probs (with grad).
 
         Args:
             rollout_ids: ``(B * n, context_len + gen_len)`` rollout token ids.
@@ -407,100 +479,14 @@ class EMAEBPModel(nn.Module):
         return features, log_probs
 
     # ------------------------------------------------------------------
-    # Rollout generation (StaticCache, no grad)
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def generate_rollouts(
-        self,
-        context_ids: torch.Tensor,
-        context_attention_mask: torch.Tensor,
-        num_rollouts: int,
-        generation_length: int,
-        temperature: float = 1.0,
-        use_cache: bool = True,
-        **generate_kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample ``num_rollouts`` completions of length ``generation_length``.
-
-        Args:
-            context_ids: ``(B, context_len)`` context token ids.
-            context_attention_mask: ``(B, context_len)`` binary mask.
-            num_rollouts: Number of completions per context.
-            generation_length: Number of new tokens to generate.
-            temperature: Sampling temperature.
-            use_cache: If True, uses StaticCache for speed and stability.
-            **generate_kwargs: Extra keyword arguments for ``model.generate``.
-
-        Returns:
-            rollout_ids:   ``(B * num_rollouts, context_len + generation_length)``
-            rollout_masks: ``(B * num_rollouts, context_len + generation_length)``
-        """
-        # Expand context per rollout
-        expanded_ids = context_ids.repeat_interleave(num_rollouts, dim=0)
-        expanded_mask = context_attention_mask.repeat_interleave(num_rollouts, dim=0)
-
-        context_len = context_ids.shape[1]
-
-        if use_cache:
-            # StaticCache pre-allocates fixed-shape KV tensors, enabling CUDA graph
-            # capture inside generate() and O(1) per-token cost instead of O(N^2).
-            batch_size = expanded_ids.shape[0]
-            max_length = context_len + generation_length
-
-            pkv = StaticCache(
-                config=self.model.config,
-                batch_size=batch_size,
-                max_cache_len=max_length,
-                device=self.model.device,
-                dtype=self.model.dtype,
-            )
-
-            output_ids = self.model.generate(
-                input_ids=expanded_ids,
-                attention_mask=expanded_mask,
-                max_new_tokens=generation_length,
-                do_sample=True,
-                temperature=temperature,
-                past_key_values=pkv,
-                use_cache=True,
-                pad_token_id=self.model.config.eos_token_id,
-                **generate_kwargs,
-            )
-        else:
-            # Fallback: O(N^2) generation without cache.
-            output_ids = self.model.generate(
-                input_ids=expanded_ids,
-                attention_mask=expanded_mask,
-                max_new_tokens=generation_length,
-                do_sample=True,
-                temperature=temperature,
-                use_cache=False,
-                pad_token_id=self.model.config.eos_token_id,
-                **generate_kwargs,
-            )
-
-        # Build attention mask for the full (context + generated) sequences
-        gen_len = output_ids.shape[1] - context_len
-        new_mask = torch.ones(
-            output_ids.shape[0], gen_len, dtype=torch.long, device=output_ids.device
-        )
-        rollout_masks = torch.cat([expanded_mask, new_mask], dim=1)
-
-        return output_ids, rollout_masks
-
-    # ------------------------------------------------------------------
     # EMA update (stop-gradient)
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def update_ema(self) -> None:
-        """Update EMA model parameters after a gradient step.
+        """Update EMA model parameters: ``ema <- decay*ema + (1-decay)*theta``.
 
-        ``ema_param <- decay * ema_param + (1 - decay) * param``
-
-        Uses fast ``_foreach`` operations to minimize Python overhead and
-        ensure graph-compatibility.
+        Uses ``_foreach`` operations to minimise Python overhead.
         """
         ema_params = list(self.ema_model.parameters())
         main_params = list(self.model.parameters())
@@ -526,7 +512,7 @@ class EMAEBPModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class OnlineEBPModel(nn.Module):
+class OnlineEBPModel(BaseEBPModel):
     """Energy-Based Pre-training using the live model as the feature network.
 
     Unlike :class:`EMAEBPModel`, no EMA copy is maintained.  The trainable
@@ -536,17 +522,14 @@ class OnlineEBPModel(nn.Module):
 
     The key efficiency advantage over ``EMAEBPModel`` is
     :meth:`extract_features_and_log_probs`: a **single forward pass** through
-    the generator simultaneously captures hidden-state features (detached via
-    hooks) and computes differentiable log-probabilities from the output
-    logits.  This halves the number of rollout-processing forward passes
-    compared to ``EMAEBPModel``.
+    the generator simultaneously captures hidden-state features (detached) *and*
+    computes differentiable log-probabilities from the output logits.
 
     Args:
         model_name: HuggingFace model identifier (default: ``"Qwen/Qwen3-0.6B"``).
         feature_layer_fractions: Relative depths at which to capture hidden
             states.
-        pool_type: Pooling strategy for hidden-state features (default: ``"last"``,
-            or ``"mean"``).
+        pool_type: Pooling strategy for hidden-state features (default: ``"last"``).
         model: Optional pre-instantiated model; if supplied, *model_name* is
             ignored.
     """
@@ -558,49 +541,16 @@ class OnlineEBPModel(nn.Module):
         pool_type: str = "last",
         model: Optional[nn.Module] = None,
     ) -> None:
-        super().__init__()
-
-        if model is not None:
-            self.model: nn.Module = model
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(model_name)
-
-        self.feature_layer_fractions = tuple(feature_layer_fractions)
-        self.pool_type = pool_type
-
-        num_layers = len(_get_transformer_layers(self.model))
-        self.feature_layer_indices: List[int] = [
-            max(0, min(round(f * num_layers) - 1, num_layers - 1))
-            for f in self.feature_layer_fractions
-        ]
+        super().__init__(model_name, feature_layer_fractions, pool_type, model)
         # Kept for compatibility with tests that inspect selected layer range.
         self._model_layers = _get_transformer_layers(self.model)
-
-    # ------------------------------------------------------------------
-    # Forward (trainable generator)
-    # ------------------------------------------------------------------
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        use_cache: bool = False,
-    ):
-        """Standard HuggingFace forward through the trainable generator."""
-        return self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            use_cache=use_cache,
-        )
 
     # ------------------------------------------------------------------
     # Feature extraction (live model, no grad - for reference features)
     # ------------------------------------------------------------------
 
-    @torch.compiler.disable
     @torch.no_grad()
+    @torch.compiler.disable
     def extract_features(
         self,
         input_ids: torch.Tensor,
@@ -611,7 +561,7 @@ class OnlineEBPModel(nn.Module):
 
         Used to compute the **reference** feature vector ``phi(c:y)`` for the
         ground-truth completion.  Gradients are not needed here because the
-        reference features are used only as fixed targets.
+        reference features serve as fixed targets.
 
         Args:
             input_ids: ``(B, L)`` token ids.
@@ -628,7 +578,6 @@ class OnlineEBPModel(nn.Module):
             output_hidden_states=True,
             return_dict=True,
         )
-
         return _features_from_hidden_states(
             hidden_states=outputs.hidden_states,
             feature_layer_indices=self.feature_layer_indices,
@@ -641,6 +590,7 @@ class OnlineEBPModel(nn.Module):
     # ------------------------------------------------------------------
     # Combined feature extraction + log-prob computation (with grad)
     # ------------------------------------------------------------------
+
     @torch.compiler.disable
     def extract_features_and_log_probs(
         self,
@@ -650,13 +600,8 @@ class OnlineEBPModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Single forward pass returning both features and log-probabilities.
 
-        A single forward call returns both hidden states and logits. Features
-        are detached immediately so no gradient flows through them, while
-        logits retain the graph for REINFORCE gradients.
-
-        This is the core efficiency gain of :class:`OnlineEBPModel`: instead
-        of two separate forward passes (EMA for features + generator for
-        log-probs), a single pass provides both.
+        Features are detached immediately so no gradient flows through them,
+        while logits retain the graph for REINFORCE gradients.
 
         Args:
             input_ids: ``(B, L)`` full sequence (context + completion).
@@ -682,11 +627,11 @@ class OnlineEBPModel(nn.Module):
             completion_start=completion_start,
             detach=True,
             pool_type=self.pool_type,
-        )  # (B, D * K), detached
+        )
 
         log_probs = _sum_completion_log_probs(
             outputs.logits, input_ids, attention_mask, completion_start
-        )  # (B,), with grad
+        )
 
         return features, log_probs
 
@@ -698,9 +643,6 @@ class OnlineEBPModel(nn.Module):
         completion_start: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Single forward pass returning CE loss and detached reference features.
-
-        Used by the memory-constrained training schedule to compute the CE
-        term and online reference features together in one full-sequence pass.
 
         Args:
             input_ids: ``(B, L)`` full sequence (context + completion).
@@ -719,7 +661,6 @@ class OnlineEBPModel(nn.Module):
             output_hidden_states=True,
             return_dict=True,
         )
-
         ref_features = _features_from_hidden_states(
             hidden_states=outputs.hidden_states,
             feature_layer_indices=self.feature_layer_indices,
@@ -733,6 +674,7 @@ class OnlineEBPModel(nn.Module):
     # ------------------------------------------------------------------
     # Combined rollout data (features + log probs in one forward pass)
     # ------------------------------------------------------------------
+
     @torch.compiler.disable
     def compute_rollout_data(
         self,
@@ -741,9 +683,6 @@ class OnlineEBPModel(nn.Module):
         completion_start: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return features and log-probs for all rollouts in a single pass.
-
-        Delegates to :meth:`extract_features_and_log_probs`, combining what
-        would be two separate forward passes in :class:`EMAEBPModel` into one.
 
         Args:
             rollout_ids: ``(B * n, context_len + gen_len)`` rollout token ids.
@@ -757,87 +696,3 @@ class OnlineEBPModel(nn.Module):
         return self.extract_features_and_log_probs(
             rollout_ids, rollout_masks, completion_start
         )
-
-    # ------------------------------------------------------------------
-    # Rollout generation with prefix KV cache (no grad)
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def generate_rollouts(
-        self,
-        context_ids: torch.Tensor,
-        context_attention_mask: torch.Tensor,
-        num_rollouts: int,
-        generation_length: int,
-        temperature: float = 1.0,
-        use_cache: bool = True,
-        **generate_kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample ``num_rollouts`` completions of length ``generation_length``.
-
-        Args:
-            context_ids: ``(B, context_len)`` context token ids.
-            context_attention_mask: ``(B, context_len)`` binary mask.
-            num_rollouts: Number of completions per context.
-            generation_length: Number of new tokens to generate.
-            temperature: Sampling temperature.
-            use_cache: If True, uses StaticCache for speed and stability.
-            **generate_kwargs: Extra keyword arguments for ``model.generate``.
-
-        Returns:
-            rollout_ids:   ``(B * num_rollouts, context_len + generation_length)``
-            rollout_masks: ``(B * num_rollouts, context_len + generation_length)``
-        """
-        # Expand context per rollout
-        expanded_ids = context_ids.repeat_interleave(num_rollouts, dim=0)
-        expanded_mask = context_attention_mask.repeat_interleave(num_rollouts, dim=0)
-        
-        context_len = context_ids.shape[1]
-        
-        if use_cache:
-            # use_cache=True uses StaticCache to ensure static shapes for the compiler 
-            # while maintaining O(1) per-token generation speed.
-            batch_size = expanded_ids.shape[0]
-            max_length = context_len + generation_length
-            
-            pkv = StaticCache(
-                config=self.model.config,
-                batch_size=batch_size,
-                max_cache_len=max_length,
-                device=self.model.device,
-                dtype=self.model.dtype,
-            )
-            
-            output_ids = self.model.generate(
-                input_ids=expanded_ids,
-                attention_mask=expanded_mask,
-                max_new_tokens=generation_length,
-                do_sample=True,
-                temperature=temperature,
-                past_key_values=pkv,
-                use_cache=True,
-                pad_token_id=self.model.config.eos_token_id,
-                **generate_kwargs,
-            )
-        else:
-            # Fallback to O(N^2) generation without cache for absolute shape stability
-            # if StaticCache is not desired.
-            output_ids = self.model.generate(
-                input_ids=expanded_ids,
-                attention_mask=expanded_mask,
-                max_new_tokens=generation_length,
-                do_sample=True,
-                temperature=temperature,
-                use_cache=False,
-                pad_token_id=self.model.config.eos_token_id,
-                **generate_kwargs,
-            )
-
-        # Build attention mask for the full (context + generated) sequences
-        gen_len = output_ids.shape[1] - context_len
-        new_mask = torch.ones(
-            output_ids.shape[0], gen_len, dtype=torch.long, device=output_ids.device
-        )
-        rollout_masks = torch.cat([expanded_mask, new_mask], dim=1)
-
-        return output_ids, rollout_masks

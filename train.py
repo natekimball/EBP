@@ -33,13 +33,14 @@ Every step the following scalars are logged to stdout and accumulated in a
 list of dicts that is pickled to ``<output_dir>/metrics.pkl`` (override with
 ``--metrics_file``)::
 
-    step          – global training step
-    loss          – total loss (reinforce + gamma * ce)
+    step           – global training step (one optimizer update)
+    loss           – total loss (reinforce + gamma * ce)
     reinforce_loss – REINFORCE policy-gradient term
-    ce_loss       – cross-entropy term (0 when --gamma 0)
-    mean_reward   – mean feature-matching reward across all rollouts
-    entropy       – mean per-token negative log-prob of rollout sequences
-                    (proxy for policy entropy; higher = more exploratory)
+    ce_loss        – cross-entropy term (0 when --gamma 0)
+    mean_reward    – mean feature-matching reward across all rollouts
+    policy_nll     – mean per-token NLL of rollout sequences (lower = more
+                     confident policy)
+    lr             – current learning rate
 
 To plot the metrics after training::
 
@@ -76,18 +77,18 @@ See ``python train.py --help`` for the full list of arguments.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import pickle
+import random
 import time
-import wandb
 from functools import partial
-from typing import Iterator, List, Union, Tuple
+from typing import Dict, Iterator, List, Tuple, Union
 
+import numpy as np
 import torch
 import torch._dynamo
-import random
-import numpy as np
-import os
+import wandb
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
@@ -98,6 +99,24 @@ from ebp.rewards import (
     compute_rloo_baseline_batched,
     compute_whitened_feature_matching_terms_batched,
 )
+
+
+# ---------------------------------------------------------------------------
+# CUDA memory tracking helpers
+# ---------------------------------------------------------------------------
+
+
+def _reset_cuda_peak(device: torch.device, enabled: bool) -> None:
+    if enabled and device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def _record_cuda_peak(
+    tag: str, device: torch.device, enabled: bool, cuda_mem: Dict[str, float]
+) -> None:
+    if enabled and device.type == "cuda":
+        cuda_mem[f"{tag}_alloc_mb"] = torch.cuda.max_memory_allocated(device) / (1024**2)
+        cuda_mem[f"{tag}_reserved_mb"] = torch.cuda.max_memory_reserved(device) / (1024**2)
 
 
 # ---------------------------------------------------------------------------
@@ -471,9 +490,25 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Use the memory-constrained training step that backpropagates CE "
-            "early before rollout processing. Disable for the regular single-"
-            "backward step (typically higher throughput when memory allows)."
+            "Split the backward pass: backpropagate CE before rollout generation "
+            "to reduce peak VRAM (~30%% savings). Disables CUDA graph capture "
+            "(compile_mode defaults to 'default' instead of 'reduce-overhead'), "
+            "so expect lower throughput. Use only when the standard path OOMs."
+        ),
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=0,
+        help="Number of linear LR warmup steps before cosine decay begins.",
+    )
+    parser.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of mini-batches to accumulate gradients over before an "
+            "optimizer step. Effective batch size = batch_size * grad_accum_steps."
         ),
     )
     return parser.parse_args()
@@ -517,25 +552,27 @@ def _train_kernel(
     gamma: float,
     whitening: bool,
     generation_length: int,
+    loss_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, ...]:
-    """Graphed training kernel containing forward, rewards, and backward.
+    """Forward pass, reward computation, and backward for EBP.
 
-    This function avoids all CPU synchronization (.item() calls) to enable
-    full CUDA graph capture when compiled with fullgraph=True.
+    Avoids CPU synchronisation (.item() calls) to enable CUDA graph capture.
+    ``loss_scale`` divides the total loss before backward, which is used for
+    gradient accumulation (pass ``1 / grad_accum_steps``).
     """
-    # 3. Rollout features + log-probs
+    # 1. Rollout features + log-probs
     rollout_features, rollout_log_probs = model.compute_rollout_data(
         rollout_ids, rollout_masks, completion_start=context_len
     )
 
-    # 4. Reference features and CE
+    # 2. Reference features and CE
     ce_loss, ref_features = model.forward_ce_and_ref_features(
         full_ids,
         full_mask,
         completion_start=context_len,
     )
 
-    # 5. Feature-matching rewards and REINFORCE loss
+    # 3. Feature-matching rewards and REINFORCE loss
     if whitening:
         alignment, diversity = compute_whitened_feature_matching_terms_batched(
             rollout_features, ref_features, num_rollouts
@@ -547,17 +584,16 @@ def _train_kernel(
     rewards = alignment - diversity  # (B * n,)
 
     baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
-    advantages = (rewards - baselines).detach()  # stop-gradient on advantages
+    advantages = (rewards - baselines).detach()
 
-    # REINFORCE: specialise maximise E[advantage * log p]  ->  minimise negation
     reinforce_loss = -(advantages * rollout_log_probs).mean()
 
-    # 6. Optional cross-entropy term
+    # 4. Backward (combined loss, scaled for gradient accumulation)
     total_loss = reinforce_loss
     if gamma > 0.0:
         total_loss = total_loss + gamma * ce_loss
 
-    total_loss.backward()
+    (total_loss * loss_scale).backward()
 
     return (
         total_loss,
@@ -580,62 +616,42 @@ def training_step(
     device: torch.device,
     log_cuda_memory: bool = False,
     whitening: bool = True,
+    loss_scale: float = 1.0,
 ) -> dict:
     """Regular EBP training step with a single backward pass.
 
-    This path is throughput-oriented: CE and REINFORCE are combined into one
-    total loss and backpropagated once. For the online model with ``gamma > 0``,
-    the CE/ref combined forward is intentionally delayed until *after* rollout
-    generation and rollout processing to match the requested ordering.
+    CE and REINFORCE are combined into one total loss and backpropagated once.
+    ``loss_scale`` (``1 / grad_accum_steps``) scales the loss before backward
+    for gradient accumulation without modifying the logged loss value.
 
     Args:
         model: Either :class:`EMAEBPModel` or :class:`OnlineEBPModel`.
-        batch: Dict of tensors from :func:`ebp.data.collate_fn` (already on device).
+        batch: Dict of tensors already on device (via GPUPrefetcher).
         num_rollouts: Number of completions to generate per context.
         generation_length: Number of tokens to generate.
-        gamma: Weight of the cross-entropy term (0 -> feature-matching only).
+        gamma: Weight of the cross-entropy term (0 → feature-matching only).
         temperature: Sampling temperature.
         device: Target device.
+        loss_scale: Multiply loss by this before backward (for grad accum).
 
     Returns:
         Dict with keys ``loss``, ``reinforce_loss``, ``ce_loss``,
-        ``mean_reward``, and ``entropy`` (mean per-token negative log-prob of
-        rollout sequences, a proxy for the policy entropy).
+        ``mean_reward``, ``mean_alignment``, ``mean_diversity``, ``policy_nll``.
     """
-    # Batch is already on device via GPUPrefetcher, no need for explicit transfer
     context_ids = batch["context_ids"]
     context_mask = batch["context_mask"]
     completion_ids = batch["completion_ids"]
     completion_mask = batch["completion_mask"]
 
-    batch_size = context_ids.shape[0]
     context_len = context_ids.shape[1]
+    cuda_mem: Dict[str, float] = {}
 
-    cuda_mem = {}
-
-    def _reset_cuda_peak(tag: str) -> None:
-        if log_cuda_memory and device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-
-    def _record_cuda_peak(tag: str) -> None:
-        if log_cuda_memory and device.type == "cuda":
-            cuda_mem[f"{tag}_alloc_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-            cuda_mem[f"{tag}_reserved_mb"] = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
-
-    # ------------------------------------------------------------------
-    # 1. Build full-sequence tensors used by ref/CE paths
-    # ------------------------------------------------------------------
     full_ids = torch.cat([context_ids, completion_ids], dim=1)
     full_mask = torch.cat([context_mask, completion_mask], dim=1)
 
-    ce_loss: torch.Tensor | None = None
-    ref_features: torch.Tensor
-
-    # ------------------------------------------------------------------
-    # 2. Generate rollouts  y_hat_j ~ p_theta(.|c)
-    # ------------------------------------------------------------------
+    # Generate rollouts y_hat_j ~ p_theta(.|c)
     model.eval()
-    _reset_cuda_peak("gen")
+    _reset_cuda_peak(device, log_cuda_memory)
     rollout_ids, rollout_masks = model.generate_rollouts(
         context_ids=context_ids,
         context_attention_mask=context_mask,
@@ -643,15 +659,11 @@ def training_step(
         generation_length=generation_length,
         temperature=temperature,
     )
-    _record_cuda_peak("gen")
-    # rollout_ids:   (B * n, context_len + generation_length)
-    # rollout_masks: (B * n, context_len + generation_length)
+    _record_cuda_peak("gen", device, log_cuda_memory, cuda_mem)
 
-    # ------------------------------------------------------------------
-    # 3-6. Training kernel (Rollout data, Rewards, Backward)
-    # ------------------------------------------------------------------
+    # Forward pass, rewards, and backward
     model.train()
-    _reset_cuda_peak("train_kernel")
+    _reset_cuda_peak(device, log_cuda_memory)
     (
         total_loss,
         reinforce_loss,
@@ -671,25 +683,20 @@ def training_step(
         gamma=gamma,
         whitening=whitening,
         generation_length=generation_length,
+        loss_scale=loss_scale,
     )
-    _record_cuda_peak("train_kernel")
+    _record_cuda_peak("train_kernel", device, log_cuda_memory, cuda_mem)
 
-    # Now extract scalars for result dict outside the (potentially) graphed kernel
-    ce_loss_val = ce_loss.item()
-    mean_reward = rewards.detach().mean().item()
-    mean_alignment = alignment.detach().mean().item()
-    mean_diversity = diversity.detach().mean().item()
     policy_nll = (-rollout_log_probs.detach().mean() / max(generation_length, 1)).item()
 
-    result = {
+    result: Dict[str, object] = {
         "loss": total_loss.item(),
         "reinforce_loss": reinforce_loss.item(),
-        "ce_loss": ce_loss_val,
-        "mean_reward": mean_reward,
-        "mean_alignment": mean_alignment,
-        "mean_diversity": mean_diversity,
-        # Logged as "entropy"; computed as per-token NLL (lower bound on H(p))
-        "entropy": policy_nll,
+        "ce_loss": ce_loss.item(),
+        "mean_reward": rewards.detach().mean().item(),
+        "mean_alignment": alignment.detach().mean().item(),
+        "mean_diversity": diversity.detach().mean().item(),
+        "policy_nll": policy_nll,
     }
     if cuda_mem:
         result["cuda_mem"] = cuda_mem
@@ -701,6 +708,7 @@ def ce_training_step(
     batch: dict,
     device: torch.device,
     log_cuda_memory: bool = False,
+    loss_scale: float = 1.0,
 ) -> dict:
     """Standard continued-pretraining step using CE loss only."""
     context_ids = batch["context_ids"]
@@ -711,9 +719,8 @@ def ce_training_step(
     full_ids = torch.cat([context_ids, completion_ids], dim=1)
     full_mask = torch.cat([context_mask, completion_mask], dim=1)
 
-    cuda_mem = {}
-    if log_cuda_memory and device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+    cuda_mem: Dict[str, float] = {}
+    _reset_cuda_peak(device, log_cuda_memory)
 
     model.train()
     ce_loss = model(
@@ -722,13 +729,11 @@ def ce_training_step(
         labels=full_ids,
         use_cache=False,
     ).loss
-    ce_loss.backward()
+    (ce_loss * loss_scale).backward()
 
-    if log_cuda_memory and device.type == "cuda":
-        cuda_mem["backward_alloc_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-        cuda_mem["backward_reserved_mb"] = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+    _record_cuda_peak("backward", device, log_cuda_memory, cuda_mem)
 
-    result = {
+    result: Dict[str, object] = {
         "loss": ce_loss.item(),
         "ce_loss": ce_loss.item(),
     }
@@ -823,7 +828,7 @@ def validation_epoch(
             "mean_reward": rewards.mean().item(),
             "mean_alignment": alignment.mean().item(),
             "mean_diversity": diversity.mean().item(),
-            "entropy": policy_nll,
+            "policy_nll": policy_nll,
         }
         all_results.append(result)
         count += 1
@@ -897,55 +902,40 @@ def memory_constrained_training_step(
     device: torch.device,
     log_cuda_memory: bool = False,
     whitening: bool = True,
+    loss_scale: float = 1.0,
 ) -> dict:
     """Memory-constrained EBP step with early CE backward.
 
-    This path reduces peak VRAM by backpropagating the CE term before rollout
-    tensors/activations are created.
+    Reduces peak VRAM by backpropagating the CE term before rollout
+    tensors/activations are created.  ``loss_scale`` (``1 / grad_accum_steps``)
+    scales both backward calls for gradient accumulation.
     """
-    # Batch is already on device via GPUPrefetcher, no need for explicit transfer
     context_ids = batch["context_ids"]
     context_mask = batch["context_mask"]
     completion_ids = batch["completion_ids"]
     completion_mask = batch["completion_mask"]
 
     context_len = context_ids.shape[1]
-    cuda_mem = {}
-
-    def _reset_cuda_peak(tag: str) -> None:
-        if log_cuda_memory and device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-
-    def _record_cuda_peak(tag: str) -> None:
-        if log_cuda_memory and device.type == "cuda":
-            cuda_mem[f"{tag}_alloc_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-            cuda_mem[f"{tag}_reserved_mb"] = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+    cuda_mem: Dict[str, float] = {}
 
     full_ids = torch.cat([context_ids, completion_ids], dim=1)
     full_mask = torch.cat([context_mask, completion_mask], dim=1)
 
-    # ------------------------------------------------------------------
-    # 1. Reference features and CE
-    # ------------------------------------------------------------------
-    # If using memory-constrained step, we compute CE here.
+    # 1. CE forward (and early backward to free activations before rollout generation)
     model.train()
-    _reset_cuda_peak("ref")
+    _reset_cuda_peak(device, log_cuda_memory)
     ce_loss, ref_features = model.forward_ce_and_ref_features(
-        full_ids,
-        full_mask,
-        completion_start=context_len,
+        full_ids, full_mask, completion_start=context_len,
     )
-    _record_cuda_peak("ref")
+    _record_cuda_peak("ref", device, log_cuda_memory, cuda_mem)
     ce_loss_val = ce_loss.item()
 
     if gamma > 0.0:
-        _reset_cuda_peak("ce_bwd_early")
-        (gamma * ce_loss).backward()
-        _record_cuda_peak("ce_bwd_early")
+        _reset_cuda_peak(device, log_cuda_memory)
+        (gamma * ce_loss * loss_scale).backward()
+        _record_cuda_peak("ce_bwd_early", device, log_cuda_memory, cuda_mem)
 
-    # ------------------------------------------------------------------
-    # 2. Generate rollouts
-    # ------------------------------------------------------------------
+    # 2. Generate rollouts (CE graph already released)
     model.eval()
     rollout_ids, rollout_masks = model.generate_rollouts(
         context_ids=context_ids,
@@ -954,15 +944,17 @@ def memory_constrained_training_step(
         generation_length=generation_length,
         temperature=temperature,
     )
-    _record_cuda_peak("gen")
+    _record_cuda_peak("gen", device, log_cuda_memory, cuda_mem)
 
+    # 3. Rollout forward pass
     model.train()
-    _reset_cuda_peak("rollout_fwd")
+    _reset_cuda_peak(device, log_cuda_memory)
     rollout_features, rollout_log_probs = model.compute_rollout_data(
         rollout_ids, rollout_masks, completion_start=context_len
     )
-    _record_cuda_peak("rollout_fwd")
+    _record_cuda_peak("rollout_fwd", device, log_cuda_memory, cuda_mem)
 
+    # 4. Feature-matching rewards and REINFORCE loss
     if whitening:
         alignment, diversity = compute_whitened_feature_matching_terms_batched(
             rollout_features, ref_features, num_rollouts
@@ -971,34 +963,26 @@ def memory_constrained_training_step(
         alignment, diversity = compute_feature_matching_terms_batched(
             rollout_features, ref_features, num_rollouts
         )
-    rewards = alignment - diversity  # (B * n,)
+    rewards = alignment - diversity
 
     baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
-    advantages = (rewards - baselines).detach()  # stop-gradient on advantages
-
-    # REINFORCE: maximise E[advantage * log p]  ->  minimise negation
+    advantages = (rewards - baselines).detach()
     reinforce_loss = -(advantages * rollout_log_probs).mean()
 
-    # Mean reward / alignment / diversity across all rollouts (diagnostics)
-    mean_reward = rewards.detach().mean().item()
-    mean_alignment = alignment.detach().mean().item()
-    mean_diversity = diversity.detach().mean().item()
     policy_nll = (-rollout_log_probs.detach().mean() / max(generation_length, 1)).item()
 
-    total_loss = reinforce_loss.item() + gamma * ce_loss_val
+    _reset_cuda_peak(device, log_cuda_memory)
+    (reinforce_loss * loss_scale).backward()
+    _record_cuda_peak("backward", device, log_cuda_memory, cuda_mem)
 
-    _reset_cuda_peak("backward")
-    reinforce_loss.backward()
-    _record_cuda_peak("backward")
-
-    result = {
-        "loss": total_loss,
+    result: Dict[str, object] = {
+        "loss": reinforce_loss.item() + gamma * ce_loss_val,
         "reinforce_loss": reinforce_loss.item(),
         "ce_loss": ce_loss_val,
-        "mean_reward": mean_reward,
-        "mean_alignment": mean_alignment,
-        "mean_diversity": mean_diversity,
-        "entropy": policy_nll,
+        "mean_reward": rewards.detach().mean().item(),
+        "mean_alignment": alignment.detach().mean().item(),
+        "mean_diversity": diversity.detach().mean().item(),
+        "policy_nll": policy_nll,
     }
     if cuda_mem:
         result["cuda_mem"] = cuda_mem
@@ -1019,14 +1003,8 @@ def train(args: argparse.Namespace) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # Optimization: Increase dynamo recompile limit to handle HF cache initialization
-    # allow unspecized integers (like layer indices) on nn.Module to be dynamic.
+    # Allow unspecified integers on nn.Module so dynamo handles HF cache layer indices.
     torch._dynamo.config.allow_unspec_int_on_nn_module = True
-    # torch._dynamo.config.recompile_limit = 32
-
-    # # Enable CUDA graphs via inductor config for better performance in reduce-overhead mode
-    # if hasattr(torch, "_inductor"):
-    #     torch._inductor.config.triton.cudagraphs = True
 
     # Initialize W&B
     wandb.init(
@@ -1133,10 +1111,11 @@ def train(args: argparse.Namespace) -> None:
             # We use fullgraph=False with 'reduce-overhead' to ensure that 
             # all graphable subgraphs (including most of the model) are still 
             # compiled into CUDA graphs, achieving the requested performance.
-            globals()["_train_kernel"] = torch.compile(
+            global _train_kernel
+            _train_kernel = torch.compile(
                 _train_kernel,
                 mode=compile_mode,
-                fullgraph=False
+                fullgraph=False,
             )
             print(f"Enabled torch.compile for training kernel (mode={compile_mode}, fullgraph=False)")
         except Exception as exc:
@@ -1167,6 +1146,31 @@ def train(args: argparse.Namespace) -> None:
         text_column="tokens" if args.tokenized else "text",
     )
     print("Train dataset loaded")
+
+    # ------------------------------------------------------------------
+    # DataLoader settings (needed by both train and val loaders)
+    # ------------------------------------------------------------------
+    pin_memory = args.pin_memory if args.pin_memory is not None else device.type == "cuda"
+    if args.num_workers is None:
+        if device.type == "cuda":
+            cpu_count = os.cpu_count() or 1
+            num_workers = max(1, min(8, cpu_count // 2))
+        else:
+            num_workers = 0
+    else:
+        num_workers = max(0, args.num_workers)
+
+    persistent_workers = (
+        args.persistent_workers
+        if args.persistent_workers is not None
+        else num_workers > 0
+    )
+
+    def _worker_init_fn(worker_id: int) -> None:
+        worker_seed = args.seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
 
     val_dataloader = None
     if args.val_split:
@@ -1209,37 +1213,21 @@ def train(args: argparse.Namespace) -> None:
             shuffle=False,
             collate_fn=partial(collate_fn, pad_token_id=pad_id),
             drop_last=False,
-            pin_memory=pin_memory if 'pin_memory' in locals() else (device.type == "cuda"),
+            pin_memory=pin_memory,
             num_workers=0,
         )
     else:
         print("No validation split provided; skipping periodic validation.")
 
     # ------------------------------------------------------------------
-    # DataLoaders
+    # Training DataLoader
     # ------------------------------------------------------------------
-    pin_memory = args.pin_memory if args.pin_memory is not None else device.type == "cuda"
-    if args.num_workers is None:
-        if device.type == "cuda":
-            cpu_count = os.cpu_count() or 1
-            num_workers = max(1, min(8, cpu_count // 2))
-        else:
-            num_workers = 0
-    else:
-        num_workers = max(0, args.num_workers)
-
-    persistent_workers = (
-        args.persistent_workers
-        if args.persistent_workers is not None
-        else num_workers > 0
+    print(
+        "DataLoader settings: "
+        f"pin_memory={pin_memory}, num_workers={num_workers}, "
+        f"persistent_workers={persistent_workers if num_workers > 0 else False}, "
+        f"prefetch_factor={args.prefetch_factor if num_workers > 0 else 'n/a'}"
     )
-
-    # Seed DataLoader workers for deterministic behaviour when num_workers>0
-    def _worker_init_fn(worker_id: int) -> None:
-        worker_seed = args.seed + worker_id
-        random.seed(worker_seed)
-        np.random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
 
     dataloader_kwargs = {
         "dataset": dataset,
@@ -1254,13 +1242,6 @@ def train(args: argparse.Namespace) -> None:
         dataloader_kwargs["persistent_workers"] = persistent_workers
         dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
         dataloader_kwargs["worker_init_fn"] = _worker_init_fn
-
-    print(
-        "DataLoader settings: "
-        f"pin_memory={pin_memory}, num_workers={num_workers}, "
-        f"persistent_workers={persistent_workers if num_workers > 0 else False}, "
-        f"prefetch_factor={args.prefetch_factor if num_workers > 0 else 'n/a'}"
-    )
 
     dataloader = DataLoader(**dataloader_kwargs)
 
@@ -1290,6 +1271,21 @@ def train(args: argparse.Namespace) -> None:
         print("Fused AdamW unsupported in this torch build; using standard AdamW")
 
     # ------------------------------------------------------------------
+    # LR scheduler: linear warmup then cosine decay
+    # ------------------------------------------------------------------
+    def _lr_lambda(step: int) -> float:
+        if args.warmup_steps > 0 and step < args.warmup_steps:
+            return step / args.warmup_steps
+        progress = (step - args.warmup_steps) / max(1, args.max_steps - args.warmup_steps)
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+    if args.warmup_steps > 0:
+        print(f"LR scheduler: {args.warmup_steps} warmup steps then cosine decay to 0")
+    else:
+        print("LR scheduler: cosine decay (no warmup)")
+
+    # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1299,10 +1295,6 @@ def train(args: argparse.Namespace) -> None:
     model.train()
     metrics_history: List[dict] = []
 
-    # Memory-constrained fallback: backpropagate CE early to release its graph
-    # before rollout tensors/activations are created. Alternative (often faster
-    # when memory headroom exists): keep CE and REINFORCE in one combined loss
-    # and call backward once.
     if args.ce_only:
         print("Using CE-only training step (continued pretraining baseline)")
         step_fn = ce_training_step
@@ -1316,8 +1308,46 @@ def train(args: argparse.Namespace) -> None:
         step_fn = training_step
         validation_fn = validation_epoch
 
-    # Wrap dataloader with GPU prefetcher for asynchronous H2D transfer
+    if args.grad_accum_steps > 1:
+        print(f"Gradient accumulation: {args.grad_accum_steps} steps "
+              f"(effective batch size = {args.batch_size * args.grad_accum_steps})")
+
+    # Build constant step kwargs (everything except loss_scale)
+    base_step_kwargs: Dict[str, object] = {
+        "model": model,
+        "device": device,
+        "log_cuda_memory": args.log_cuda_memory,
+    }
+    if not args.ce_only:
+        base_step_kwargs.update(
+            {
+                "num_rollouts": args.num_rollouts,
+                "generation_length": args.generation_length,
+                "gamma": args.gamma,
+                "temperature": args.temperature,
+                "whitening": args.whitening,
+            }
+        )
+
+    base_val_kwargs: Dict[str, object] = {
+        "model": model,
+        "dataloader": val_dataloader,
+        "device": device,
+        "max_batches": args.max_val_batches,
+    }
+    if not args.ce_only:
+        base_val_kwargs.update(
+            {
+                "num_rollouts": args.num_rollouts,
+                "generation_length": args.generation_length,
+                "gamma": args.gamma,
+                "temperature": args.temperature,
+                "whitening": args.whitening,
+            }
+        )
+
     prefetched_loader = GPUPrefetcher(dataloader, device)
+    loss_scale = 1.0 / args.grad_accum_steps
 
     # ------------------------------------------------------------------
     # Baseline validation
@@ -1325,127 +1355,96 @@ def train(args: argparse.Namespace) -> None:
     if val_dataloader is not None:
         print("Running baseline validation (step 0)...")
         baseline_val_start = time.perf_counter()
-        validation_kwargs = {
-            "model": model,
-            "dataloader": val_dataloader,
-            "device": device,
-            "max_batches": args.max_val_batches,
-        }
-        if not args.ce_only:
-            validation_kwargs.update(
-                {
-                    "num_rollouts": args.num_rollouts,
-                    "generation_length": args.generation_length,
-                    "gamma": args.gamma,
-                    "temperature": args.temperature,
-                    "whitening": args.whitening,
-                }
-            )
-        val_res = validation_fn(**validation_kwargs)
+        val_res = validation_fn(**base_val_kwargs)
         baseline_val_duration = time.perf_counter() - baseline_val_start
         print(f"Baseline validation duration: {baseline_val_duration:.2f}s")
         if val_res:
             if args.ce_only:
-                print(
-                    f"Step      0 [VAL] | loss={val_res['loss']:.4f} "
-                    f"ce={val_res['ce_loss']:.4f}"
-                )
+                print(f"Step      0 [VAL] | loss={val_res['loss']:.4f} ce={val_res['ce_loss']:.4f}")
             else:
                 print(
                     f"Step      0 [VAL] | loss={val_res['loss']:.4f} "
                     f"reinforce={val_res['reinforce_loss']:.4f} "
                     f"ce={val_res['ce_loss']:.4f} "
                     f"reward={val_res['mean_reward']:.4f} "
-                    f"entropy={val_res['entropy']:.4f}"
+                    f"nll={val_res['policy_nll']:.4f}"
                 )
             val_metrics = {
                 "step": 0,
-                **{
-                    f"val_{key}": value
-                    for key, value in val_res.items()
-                    if key not in {"step", "cuda_mem"}
-                },
+                **{f"val_{k}": v for k, v in val_res.items() if k not in {"step", "cuda_mem"}},
+                "val_duration_sec": baseline_val_duration,
             }
-            val_metrics["val_duration_sec"] = baseline_val_duration
             wandb.log(val_metrics)
+
+    # ------------------------------------------------------------------
+    # Main training loop (with gradient accumulation)
+    # ------------------------------------------------------------------
+    optimizer.zero_grad(set_to_none=True)
+    accum_count = 0
+    accum_results: List[dict] = []
 
     while step < args.max_steps:
         for batch in prefetched_loader:
             if step >= args.max_steps:
                 break
 
+            result = step_fn(batch=batch, loss_scale=loss_scale, **base_step_kwargs)
+            accum_results.append(result)
+            accum_count += 1
+
+            if accum_count < args.grad_accum_steps:
+                continue
+
+            # Optimizer update
+            torch.nn.utils.clip_grad_norm_(model.model.parameters(), args.grad_clip)
+            _reset_cuda_peak(device, args.log_cuda_memory)
+            optimizer.step()
+            _record_cuda_peak("opt_step", device, args.log_cuda_memory,
+                               result.setdefault("cuda_mem", {}))
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
-            step_kwargs = {
-                "model": model,
-                "batch": batch,
-                "device": device,
-                "log_cuda_memory": args.log_cuda_memory,
-            }
-            if not args.ce_only:
-                step_kwargs.update(
-                    {
-                        "num_rollouts": args.num_rollouts,
-                        "generation_length": args.generation_length,
-                        "gamma": args.gamma,
-                        "temperature": args.temperature,
-                        "whitening": args.whitening,
-                    }
-                )
-            result = step_fn(**step_kwargs)
-            torch.nn.utils.clip_grad_norm_(model.model.parameters(), args.grad_clip)
-            if args.log_cuda_memory and device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats(device)
-            optimizer.step()
-            if args.log_cuda_memory and device.type == "cuda":
-                result.setdefault("cuda_mem", {})["opt_step_alloc_mb"] = (
-                    torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-                )
-                result.setdefault("cuda_mem", {})["opt_step_reserved_mb"] = (
-                    torch.cuda.max_memory_reserved(device) / (1024 ** 2)
-                )
-
-            # Update EMA feature network (only for EMAEBPModel)
             if isinstance(model, EMAEBPModel) and not args.ce_only:
                 model.update_ema()
 
             step += 1
+            accum_count = 0
 
-            # Loss is already stored as a detached scalar for logging.
-            loss_val = result["loss"]
-
-            # Record metrics for every step (floats only, very lightweight)
-            train_metrics = {
-                "step": step,
-                **{
-                    key: value
-                    for key, value in result.items()
-                    if key not in {"step", "cuda_mem"}
-                },
+            # Average metrics over accumulated mini-batches
+            scalar_keys = [k for k, v in accum_results[0].items()
+                           if k != "cuda_mem" and isinstance(v, (int, float))]
+            avg_result: Dict[str, object] = {
+                k: sum(r[k] for r in accum_results) / len(accum_results)  # type: ignore[operator]
+                for k in scalar_keys
             }
+            if "cuda_mem" in result:
+                avg_result["cuda_mem"] = result["cuda_mem"]
+            accum_results = []
+
+            avg_result["lr"] = optimizer.param_groups[0]["lr"]
+            loss_val = avg_result["loss"]
+
+            train_metrics = {"step": step, **{k: v for k, v in avg_result.items() if k != "cuda_mem"}}
             metrics_history.append(train_metrics)
-            # Log to W&B
-            wandb.log(metrics_history[-1])
+            wandb.log(train_metrics)
 
             if step % args.log_steps == 0:
                 if args.ce_only:
-                    print(
-                        f"Step {step:6d} | loss={loss_val:.4f} "
-                        f"ce={result['ce_loss']:.4f}"
-                    )
+                    print(f"Step {step:6d} | loss={loss_val:.4f} ce={avg_result['ce_loss']:.4f} lr={avg_result['lr']:.2e}")
                 else:
                     print(
                         f"Step {step:6d} | loss={loss_val:.4f} "
-                        f"reinforce={result['reinforce_loss']:.4f} "
-                        f"ce={result['ce_loss']:.4f} "
-                        f"reward={result['mean_reward']:.4f} "
-                        f"align={result['mean_alignment']:.4f} "
-                        f"div={result['mean_diversity']:.4f} "
-                        f"entropy={result['entropy']:.4f}"
+                        f"reinforce={avg_result['reinforce_loss']:.4f} "
+                        f"ce={avg_result['ce_loss']:.4f} "
+                        f"reward={avg_result['mean_reward']:.4f} "
+                        f"align={avg_result['mean_alignment']:.4f} "
+                        f"div={avg_result['mean_diversity']:.4f} "
+                        f"nll={avg_result['policy_nll']:.4f} "
+                        f"lr={avg_result['lr']:.2e}"
                     )
-                if args.log_cuda_memory and device.type == "cuda" and "cuda_mem" in result:
-                    mem = result["cuda_mem"]
-                    mem_line = (
+                if args.log_cuda_memory and device.type == "cuda" and "cuda_mem" in avg_result:
+                    mem = avg_result["cuda_mem"]
+                    print(
                         "CUDA peak MB | "
                         f"ref={mem.get('ref_alloc_mb', 0.0):.0f}/{mem.get('ref_reserved_mb', 0.0):.0f} "
                         f"gen={mem.get('gen_alloc_mb', 0.0):.0f}/{mem.get('gen_reserved_mb', 0.0):.0f} "
@@ -1453,54 +1452,28 @@ def train(args: argparse.Namespace) -> None:
                         f"backward={mem.get('backward_alloc_mb', 0.0):.0f}/{mem.get('backward_reserved_mb', 0.0):.0f} "
                         f"opt={mem.get('opt_step_alloc_mb', 0.0):.0f}/{mem.get('opt_step_reserved_mb', 0.0):.0f}"
                     )
-                    print(mem_line)
 
             if step % args.val_steps == 0 and val_dataloader is not None:
                 print(f"Running validation at step {step}...")
-                validation_kwargs = {
-                    "model": model,
-                    "dataloader": val_dataloader,
-                    "device": device,
-                    "max_batches": args.max_val_batches,
-                }
-                if not args.ce_only:
-                    validation_kwargs.update(
-                        {
-                            "num_rollouts": args.num_rollouts,
-                            "generation_length": args.generation_length,
-                            "gamma": args.gamma,
-                            "temperature": args.temperature,
-                            "whitening": args.whitening,
-                        }
-                    )
-                val_res = validation_fn(**validation_kwargs)
+                val_res = validation_fn(**base_val_kwargs)
                 if val_res:
                     if args.ce_only:
-                        print(
-                            f"Step {step:6d} [VAL] | loss={val_res['loss']:.4f} "
-                            f"ce={val_res['ce_loss']:.4f}"
-                        )
+                        print(f"Step {step:6d} [VAL] | loss={val_res['loss']:.4f} ce={val_res['ce_loss']:.4f}")
                     else:
                         print(
                             f"Step {step:6d} [VAL] | loss={val_res['loss']:.4f} "
                             f"reinforce={val_res['reinforce_loss']:.4f} "
                             f"ce={val_res['ce_loss']:.4f} "
                             f"reward={val_res['mean_reward']:.4f} "
-                            f"entropy={val_res['entropy']:.4f}"
+                            f"nll={val_res['policy_nll']:.4f}"
                         )
-                    # Store validation metrics with a prefix
                     val_metrics = {
                         "step": step,
-                        **{
-                            f"val_{key}": value
-                            for key, value in val_res.items()
-                            if key not in {"step", "cuda_mem"}
-                        },
+                        **{f"val_{k}": v for k, v in val_res.items() if k not in {"step", "cuda_mem"}},
                     }
                     metrics_history[-1].update(val_metrics)
-                    # Log validation to W&B
                     wandb.log(val_metrics)
-                
+
             if step % args.save_steps == 0:
                 save_path = os.path.join(args.output_dir, f"step_{step}")
                 model.model.save_pretrained(save_path)
