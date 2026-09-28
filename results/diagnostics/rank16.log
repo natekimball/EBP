@@ -1,0 +1,30 @@
+Loading weights:   0%|          | 0/310 [00:00<?, ?it/s]Loading weights:   0%|          | 1/310 [00:00<01:27,  3.52it/s]Loading weights:  23%|██▎       | 72/310 [00:00<00:00, 238.01it/s]Loading weights:  36%|███▋      | 113/310 [00:00<00:01, 190.66it/s]Loading weights:  46%|████▌     | 143/310 [00:00<00:00, 204.90it/s]Loading weights:  55%|█████▌    | 171/310 [00:01<00:00, 139.90it/s]Loading weights:  62%|██████▏   | 192/310 [00:01<00:01, 112.36it/s]Loading weights:  67%|██████▋   | 208/310 [00:01<00:00, 111.44it/s]Loading weights:  75%|███████▌  | 234/310 [00:01<00:00, 135.92it/s]Loading weights:  82%|████████▏ | 254/310 [00:01<00:00, 138.01it/s]Loading weights:  87%|████████▋ | 271/310 [00:01<00:00, 142.13it/s]Loading weights:  93%|█████████▎| 288/310 [00:02<00:00, 141.79it/s]Loading weights: 100%|██████████| 310/310 [00:02<00:00, 144.95it/s]
+  ctx 1/16  rho=+0.905  (108s)
+  ctx 2/16  rho=-0.143  (213s)
+  ctx 3/16  rho=+0.548  (313s)
+  ctx 4/16  rho=-0.071  (418s)
+  ctx 5/16  rho=+0.286  (522s)
+  ctx 6/16  rho=-0.048  (623s)
+  ctx 7/16  rho=-0.595  (729s)
+  ctx 8/16  rho=+0.095  (834s)
+  ctx 9/16  rho=+0.548  (941s)
+  ctx 10/16  rho=+0.405  (1048s)
+  ctx 11/16  rho=+0.833  (1154s)
+  ctx 12/16  rho=-0.357  (1260s)
+  ctx 13/16  rho=+0.476  (1365s)
+  ctx 14/16  rho=-0.143  (1470s)
+  ctx 15/16  rho=+0.000  (1577s)
+  ctx 16/16  rho=-0.048  (1685s)
+
+=== A: degradation ladder (GEN=16, 16 contexts) ===
+  sampling        mean alignment  (higher should = better)
+  temp=0.7         +1.6779  +/- 0.5505
+  temp=1.0         +1.5623  +/- 0.5856
+  temp=1.5         +1.2818  +/- 0.5669
+  temp=3.0         +1.2314  +/- 0.2159
+  temp=random      +0.9419  +/- 0.2065
+
+=== B: within-batch rank corr vs token overlap (n=8) ===
+  mean Spearman rho = +0.1682   sd 0.4088   n=16
+  fraction of contexts with rho > 0: 50.0%  (chance = 50%)
+  mean within-batch alignment spread = 0.2560

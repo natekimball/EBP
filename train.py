@@ -83,7 +83,7 @@ import pickle
 import random
 import time
 from functools import partial
-from typing import Dict, Iterator, List, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -94,10 +94,12 @@ from transformers import AutoTokenizer
 
 from ebp.data import PretrainingDataset, collate_fn
 from ebp.model import EMAEBPModel, OnlineEBPModel
+from ebp.sigreg import mean_pairwise_cosine, sigreg_loss
 from ebp.rewards import (
+    compute_advantages_batched,
     compute_feature_matching_terms_batched,
-    compute_rloo_baseline_batched,
     compute_whitened_feature_matching_terms_batched,
+    reinforce_loss_from_advantages,
 )
 
 
@@ -177,8 +179,19 @@ class GPUPrefetcher:
         yield batch
 
     def _move_to_device_async(self, batch: dict) -> dict:
-        """Move batch to device asynchronously (in prefetch stream)."""
-        return {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        """Move batch to device asynchronously (in prefetch stream).
+
+        The destination tensors are allocated on ``self.stream``, but they are
+        consumed by kernels on the default stream.  ``record_stream`` tells the
+        caching allocator not to hand their memory to a later prefetch until
+        those consumer kernels have retired; without it the next batch's copy
+        can silently overwrite the batch currently being trained on.
+        """
+        moved = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        current = torch.cuda.current_stream(self.device)
+        for tensor in moved.values():
+            tensor.record_stream(current)
+        return moved
 
     def _move_to_device(self, batch: dict) -> dict:
         """Move batch to device synchronously (CPU only)."""
@@ -199,7 +212,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_name",
         type=str,
-        default="Qwen/Qwen3-0.6B",
+        default="Qwen/Qwen3-0.6B-Base",
         help="HuggingFace model identifier.",
     )
     parser.add_argument(
@@ -301,7 +314,79 @@ def parse_args() -> argparse.Namespace:
         "--gamma",
         type=float,
         default=0.1,
-        help="Weight of the cross-entropy term in the mixed objective.",
+        help=(
+            "Weight of the cross-entropy term relative to the REINFORCE term. "
+            "AdamW is invariant to the overall loss scale, so this ratio alone "
+            "sets the balance between the two objectives. The REINFORCE "
+            "gradient measures ~25-33x a gamma=0.1 CE gradient on Qwen3-0.6B, "
+            "so gamma well above 1.0 is needed for CE to dominate."
+        ),
+    )
+    parser.add_argument(
+        "--sigreg_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the SIGReg anti-collapse penalty (LeJEPA). Pushes the "
+            "per-layer feature directions toward uniform on the sphere — the "
+            "isotropic-Gaussian target after L2 normalisation. 0.0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--sigreg_mode",
+        type=str,
+        default="full",
+        choices=["full", "weak"],
+        help=(
+            "'full' is the Epps-Pulley test on random 1-D slices (matches all "
+            "moments); 'weak' sketches to --sigreg_sketch_dim and penalises "
+            "||Cov - I||_F (second moment only, and needs N > sketch_dim "
+            "samples to be full rank)."
+        ),
+    )
+    parser.add_argument(
+        "--sigreg_positions",
+        type=int,
+        default=64,
+        help=(
+            "Sequence positions sampled per example for SIGReg. Pooled "
+            "sequence features would give only batch_size samples, far too few "
+            "for a distributional statistic; per-position sampling yields "
+            "batch_size * this many at no extra forward cost."
+        ),
+    )
+    parser.add_argument(
+        "--sigreg_slices",
+        type=int,
+        default=8,
+        help="Random 1-D projections for --sigreg_mode full.",
+    )
+    parser.add_argument(
+        "--sigreg_sketch_dim",
+        type=int,
+        default=64,
+        help="Sketch width for --sigreg_mode weak.",
+    )
+    parser.add_argument(
+        "--min_reward_std",
+        type=float,
+        default=0.0,
+        help=(
+            "Drop contexts whose reward spread across rollouts is at or below "
+            "this value (continuous analogue of DAPO dynamic sampling). Such "
+            "groups carry no learning signal; 0.0 disables filtering."
+        ),
+    )
+    parser.add_argument(
+        "--loss_agg",
+        type=str,
+        default="token",
+        choices=["token", "sequence"],
+        help=(
+            "REINFORCE loss aggregation. 'token' normalises by total completion "
+            "tokens in the batch (DAPO-style, length-unbiased); 'sequence' "
+            "averages over rollouts (the length-biased per-sample form)."
+        ),
     )
     parser.add_argument(
         "--ce_only",
@@ -322,6 +407,17 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Whether to use whitened feature matching (Eq. 9 of the EBFT paper).",
+    )
+    parser.add_argument(
+        "--rollout_chunk_size",
+        type=int,
+        default=None,
+        help=(
+            "When set, compute rollout features and log-probs in chunks of this many "
+            "sequences to avoid OOM on large (B * num_rollouts) batches. "
+            "Features are computed no_grad per chunk; log-prob backward is called "
+            "immediately after each chunk so logit tensors are never live simultaneously."
+        ),
     )
     parser.add_argument(
         "--pool_type",
@@ -354,6 +450,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save_steps", type=int, default=10_000)
     parser.add_argument("--output_dir", type=str, default="./output")
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a step_N checkpoint directory to resume training from.",
+    )
     parser.add_argument(
         "--metrics_file",
         type=str,
@@ -553,6 +655,13 @@ def _train_kernel(
     whitening: bool,
     generation_length: int,
     loss_scale: float = 1.0,
+    min_reward_std: float = 0.0,
+    loss_agg: str = "token",
+    sigreg_weight: float = 0.0,
+    sigreg_mode: str = "full",
+    sigreg_positions: int = 64,
+    sigreg_slices: int = 8,
+    sigreg_sketch_dim: int = 64,
 ) -> Tuple[torch.Tensor, ...]:
     """Forward pass, reward computation, and backward for EBP.
 
@@ -565,12 +674,19 @@ def _train_kernel(
         rollout_ids, rollout_masks, completion_start=context_len
     )
 
-    # 2. Reference features and CE
-    ce_loss, ref_features = model.forward_ce_and_ref_features(
+    # 2. Reference features and CE (plus gradient-carrying features for SIGReg)
+    sig_positions = sigreg_positions if sigreg_weight > 0.0 else 0
+    ce_out = model.forward_ce_and_ref_features(
         full_ids,
         full_mask,
         completion_start=context_len,
+        sigreg_positions=sig_positions,
     )
+    if sig_positions > 0:
+        ce_loss, ref_features, policy_features = ce_out
+    else:
+        ce_loss, ref_features = ce_out
+        policy_features = None
 
     # 3. Feature-matching rewards and REINFORCE loss
     if whitening:
@@ -583,15 +699,38 @@ def _train_kernel(
         )
     rewards = alignment - diversity  # (B * n,)
 
-    baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
-    advantages = (rewards - baselines).detach()
+    advantages, group_std, active = compute_advantages_batched(
+        rewards, num_rollouts, min_reward_std=min_reward_std
+    )
+    advantages = advantages.detach()
 
-    reinforce_loss = -(advantages * rollout_log_probs).mean()
+    # Completion tokens per rollout, for length-unbiased token-level aggregation.
+    comp_tokens = rollout_masks[:, context_len:].sum(dim=1).to(rollout_log_probs.dtype)
 
-    # 4. Backward (combined loss, scaled for gradient accumulation)
+    reinforce_loss = reinforce_loss_from_advantages(
+        advantages, rollout_log_probs, comp_tokens, loss_agg=loss_agg
+    )
+
+    # 4. SIGReg anti-collapse penalty on the feature distribution
+    if policy_features is not None:
+        sig_loss = sigreg_loss(
+            policy_features,
+            num_layers=len(model.feature_layer_indices),
+            mode=sigreg_mode,
+            num_slices=sigreg_slices,
+            sketch_dim=sigreg_sketch_dim,
+        )
+        feat_cos = mean_pairwise_cosine(policy_features.detach())
+    else:
+        sig_loss = ce_loss.new_zeros(())
+        feat_cos = ce_loss.new_zeros(())
+
+    # 5. Backward (combined loss, scaled for gradient accumulation)
     total_loss = reinforce_loss
     if gamma > 0.0:
         total_loss = total_loss + gamma * ce_loss
+    if sigreg_weight > 0.0:
+        total_loss = total_loss + sigreg_weight * sig_loss
 
     (total_loss * loss_scale).backward()
 
@@ -603,6 +742,11 @@ def _train_kernel(
         alignment,
         diversity,
         rollout_log_probs,
+        advantages,
+        group_std,
+        active,
+        sig_loss,
+        feat_cos,
     )
 
 
@@ -617,6 +761,13 @@ def training_step(
     log_cuda_memory: bool = False,
     whitening: bool = True,
     loss_scale: float = 1.0,
+    min_reward_std: float = 0.0,
+    loss_agg: str = "token",
+    sigreg_weight: float = 0.0,
+    sigreg_mode: str = "full",
+    sigreg_positions: int = 64,
+    sigreg_slices: int = 8,
+    sigreg_sketch_dim: int = 64,
 ) -> dict:
     """Regular EBP training step with a single backward pass.
 
@@ -672,6 +823,11 @@ def training_step(
         alignment,
         diversity,
         rollout_log_probs,
+        advantages,
+        group_std,
+        active,
+        sig_loss,
+        feat_cos,
     ) = _train_kernel(
         model=model,
         rollout_ids=rollout_ids,
@@ -684,6 +840,13 @@ def training_step(
         whitening=whitening,
         generation_length=generation_length,
         loss_scale=loss_scale,
+        min_reward_std=min_reward_std,
+        loss_agg=loss_agg,
+        sigreg_weight=sigreg_weight,
+        sigreg_mode=sigreg_mode,
+        sigreg_positions=sigreg_positions,
+        sigreg_slices=sigreg_slices,
+        sigreg_sketch_dim=sigreg_sketch_dim,
     )
     _record_cuda_peak("train_kernel", device, log_cuda_memory, cuda_mem)
 
@@ -697,6 +860,13 @@ def training_step(
         "mean_alignment": alignment.detach().mean().item(),
         "mean_diversity": diversity.detach().mean().item(),
         "policy_nll": policy_nll,
+        # Signal diagnostics: how much reward spread each context actually has,
+        # and what fraction of contexts survived --min_reward_std.
+        "reward_std": group_std.detach().mean().item(),
+        "adv_std": advantages.detach().std().item(),
+        "frac_active_groups": active.detach().float().mean().item(),
+        "sigreg_loss": sig_loss.detach().item(),
+        "feature_cos": feat_cos.detach().item(),
     }
     if cuda_mem:
         result["cuda_mem"] = cuda_mem
@@ -752,6 +922,9 @@ def validation_epoch(
     device: torch.device,
     max_batches: int = 50,
     whitening: bool = True,
+    rollout_chunk_size: Optional[int] = None,
+    min_reward_std: float = 0.0,
+    loss_agg: str = "token",
 ) -> dict:
     """Computes mean metrics over validation batches.
 
@@ -789,8 +962,13 @@ def validation_epoch(
         )
 
         # 2. Rollout features + log-probs
+        # EMAEBPModel.compute_rollout_data has no chunk_size parameter.
+        rollout_kwargs = {}
+        if rollout_chunk_size is not None and isinstance(model, OnlineEBPModel):
+            rollout_kwargs["chunk_size"] = rollout_chunk_size
         rollout_features, rollout_log_probs = model.compute_rollout_data(
-            rollout_ids, rollout_masks, completion_start=context_len
+            rollout_ids, rollout_masks, completion_start=context_len,
+            **rollout_kwargs,
         )
 
         # 3. Reference features and CE
@@ -811,9 +989,13 @@ def validation_epoch(
             )
         rewards = alignment - diversity
 
-        baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
-        advantages = (rewards - baselines)
-        reinforce_loss = -(advantages * rollout_log_probs).mean()
+        advantages, group_std, active = compute_advantages_batched(
+            rewards, num_rollouts, min_reward_std=min_reward_std
+        )
+        comp_tokens = rollout_masks[:, context_len:].sum(dim=1).to(rollout_log_probs.dtype)
+        reinforce_loss = reinforce_loss_from_advantages(
+            advantages, rollout_log_probs, comp_tokens, loss_agg=loss_agg
+        )
 
         total_loss = reinforce_loss
         if gamma > 0.0:
@@ -829,6 +1011,9 @@ def validation_epoch(
             "mean_alignment": alignment.mean().item(),
             "mean_diversity": diversity.mean().item(),
             "policy_nll": policy_nll,
+            "reward_std": group_std.mean().item(),
+            "adv_std": advantages.std().item(),
+            "frac_active_groups": active.float().mean().item(),
         }
         all_results.append(result)
         count += 1
@@ -850,6 +1035,8 @@ def ce_validation_epoch(
     dataloader: DataLoader,
     device: torch.device,
     max_batches: int = 50,
+    rollout_chunk_size: Optional[int] = None,  # unused; accepted for a uniform call site
+    **_unused,
 ) -> dict:
     """Computes mean CE-only validation metrics over validation batches."""
     model.eval()
@@ -903,6 +1090,14 @@ def memory_constrained_training_step(
     log_cuda_memory: bool = False,
     whitening: bool = True,
     loss_scale: float = 1.0,
+    rollout_chunk_size: Optional[int] = None,
+    min_reward_std: float = 0.0,
+    loss_agg: str = "token",
+    sigreg_weight: float = 0.0,
+    sigreg_mode: str = "full",
+    sigreg_positions: int = 64,
+    sigreg_slices: int = 8,
+    sigreg_sketch_dim: int = 64,
 ) -> dict:
     """Memory-constrained EBP step with early CE backward.
 
@@ -924,15 +1119,45 @@ def memory_constrained_training_step(
     # 1. CE forward (and early backward to free activations before rollout generation)
     model.train()
     _reset_cuda_peak(device, log_cuda_memory)
-    ce_loss, ref_features = model.forward_ce_and_ref_features(
+    sig_positions = sigreg_positions if sigreg_weight > 0.0 else 0
+    ce_out = model.forward_ce_and_ref_features(
         full_ids, full_mask, completion_start=context_len,
+        sigreg_positions=sig_positions,
     )
+    if sig_positions > 0:
+        ce_loss, ref_features, policy_features = ce_out
+    else:
+        ce_loss, ref_features = ce_out
+        policy_features = None
     _record_cuda_peak("ref", device, log_cuda_memory, cuda_mem)
     ce_loss_val = ce_loss.item()
 
+    # SIGReg shares the CE graph, so it must be backpropagated in the same call
+    # as CE — the early backward below frees that graph before the rollouts run.
+    if policy_features is not None:
+        sig_loss = sigreg_loss(
+            policy_features,
+            num_layers=len(model.feature_layer_indices),
+            mode=sigreg_mode,
+            num_slices=sigreg_slices,
+            sketch_dim=sigreg_sketch_dim,
+        )
+        feat_cos_val = mean_pairwise_cosine(policy_features.detach()).item()
+    else:
+        sig_loss = None
+        feat_cos_val = 0.0
+    sig_loss_val = sig_loss.item() if sig_loss is not None else 0.0
+
+    early_loss = None
     if gamma > 0.0:
+        early_loss = gamma * ce_loss
+    if sig_loss is not None:
+        term = sigreg_weight * sig_loss
+        early_loss = term if early_loss is None else early_loss + term
+
+    if early_loss is not None:
         _reset_cuda_peak(device, log_cuda_memory)
-        (gamma * ce_loss * loss_scale).backward()
+        (early_loss * loss_scale).backward()
         _record_cuda_peak("ce_bwd_early", device, log_cuda_memory, cuda_mem)
 
     # 2. Generate rollouts (CE graph already released)
@@ -949,9 +1174,23 @@ def memory_constrained_training_step(
     # 3. Rollout forward pass
     model.train()
     _reset_cuda_peak(device, log_cuda_memory)
-    rollout_features, rollout_log_probs = model.compute_rollout_data(
-        rollout_ids, rollout_masks, completion_start=context_len
+
+    use_chunked = (
+        rollout_chunk_size is not None
+        and hasattr(model, "compute_rollout_features")
+        and hasattr(model, "compute_log_probs_chunk")
     )
+
+    if use_chunked:
+        # 3a. Features only (no_grad, chunked) — logits freed after each chunk
+        rollout_features = model.compute_rollout_features(
+            rollout_ids, rollout_masks, completion_start=context_len,
+            chunk_size=rollout_chunk_size,
+        )
+    else:
+        rollout_features, rollout_log_probs = model.compute_rollout_data(
+            rollout_ids, rollout_masks, completion_start=context_len
+        )
     _record_cuda_peak("rollout_fwd", device, log_cuda_memory, cuda_mem)
 
     # 4. Feature-matching rewards and REINFORCE loss
@@ -965,24 +1204,63 @@ def memory_constrained_training_step(
         )
     rewards = alignment - diversity
 
-    baselines = compute_rloo_baseline_batched(rewards, num_rollouts)
-    advantages = (rewards - baselines).detach()
-    reinforce_loss = -(advantages * rollout_log_probs).mean()
-
-    policy_nll = (-rollout_log_probs.detach().mean() / max(generation_length, 1)).item()
+    advantages, group_std, active = compute_advantages_batched(
+        rewards, num_rollouts, min_reward_std=min_reward_std
+    )
+    advantages = advantages.detach()
+    comp_tokens = rollout_masks[:, context_len:].sum(dim=1).float()
+    total_comp_tokens = comp_tokens.sum().clamp(min=1.0)
 
     _reset_cuda_peak(device, log_cuda_memory)
-    (reinforce_loss * loss_scale).backward()
+    if use_chunked:
+        # 3b+5. Log probs + reinforce backward (chunked) — one backward per chunk
+        # so no chunk's logit tensor (chunk_size × L × V) stays live past its backward.
+        total_seqs = rollout_ids.shape[0]
+        reinforce_loss_val = 0.0
+        log_probs_list: list[torch.Tensor] = []
+        for start in range(0, total_seqs, rollout_chunk_size):
+            chunk_ids = rollout_ids[start : start + rollout_chunk_size]
+            chunk_masks = rollout_masks[start : start + rollout_chunk_size]
+            adv_chunk = advantages[start : start + rollout_chunk_size]
+
+            lp_chunk = model.compute_log_probs_chunk(chunk_ids, chunk_masks, context_len)
+            log_probs_list.append(lp_chunk.detach())
+
+            # Denominator matches the unchunked aggregation exactly: total
+            # completion tokens for "token", total sequences for "sequence".
+            denom = (
+                total_comp_tokens if loss_agg == "token"
+                else float(total_seqs)
+            )
+            chunk_loss = -(adv_chunk * lp_chunk).sum() / denom
+            (chunk_loss * loss_scale).backward()
+            reinforce_loss_val += chunk_loss.item()
+
+        policy_nll = (
+            -torch.cat(log_probs_list).mean() / max(generation_length, 1)
+        ).item()
+    else:
+        reinforce_loss = reinforce_loss_from_advantages(
+            advantages, rollout_log_probs, comp_tokens, loss_agg=loss_agg
+        )
+        reinforce_loss_val = reinforce_loss.item()
+        policy_nll = (-rollout_log_probs.detach().mean() / max(generation_length, 1)).item()
+        (reinforce_loss * loss_scale).backward()
     _record_cuda_peak("backward", device, log_cuda_memory, cuda_mem)
 
     result: Dict[str, object] = {
-        "loss": reinforce_loss.item() + gamma * ce_loss_val,
-        "reinforce_loss": reinforce_loss.item(),
+        "loss": reinforce_loss_val + gamma * ce_loss_val,
+        "reinforce_loss": reinforce_loss_val,
         "ce_loss": ce_loss_val,
         "mean_reward": rewards.detach().mean().item(),
         "mean_alignment": alignment.detach().mean().item(),
         "mean_diversity": diversity.detach().mean().item(),
         "policy_nll": policy_nll,
+        "reward_std": group_std.detach().mean().item(),
+        "adv_std": advantages.detach().std().item(),
+        "frac_active_groups": active.detach().float().mean().item(),
+        "sigreg_loss": sig_loss_val,
+        "feature_cos": feat_cos_val,
     }
     if cuda_mem:
         result["cuda_mem"] = cuda_mem
@@ -1005,6 +1283,10 @@ def train(args: argparse.Namespace) -> None:
 
     # Allow unspecified integers on nn.Module so dynamo handles HF cache layer indices.
     torch._dynamo.config.allow_unspec_int_on_nn_module = True
+    # StaticCache indexes a Python list by layer_idx, forcing one compiled trace per
+    # layer. Raise the cache limit above num_layers (28) so Dynamo caches all of them
+    # instead of falling back to eager after the default limit of 8.
+    torch._dynamo.config.cache_size_limit = 64
 
     # Initialize W&B
     wandb.init(
@@ -1034,11 +1316,18 @@ def train(args: argparse.Namespace) -> None:
         }
         torch_dtype = dtype_map[args.dtype]
     print(f"Using dtype: {torch_dtype}")
+    if torch_dtype == torch.float16:
+        print(
+            "WARNING: training in pure float16 without loss scaling. Gradients "
+            "underflow easily at this precision and the run may stall or diverge. "
+            "Prefer --dtype bfloat16 (Ampere+) or --dtype float32."
+        )
 
     # ------------------------------------------------------------------
     # Tokeniser
     # ------------------------------------------------------------------
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model_source = args.resume_from_checkpoint if args.resume_from_checkpoint else args.model_name
+    tokenizer = AutoTokenizer.from_pretrained(model_source)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -1047,7 +1336,7 @@ def train(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
-    print(f"Loading model: {args.model_name} (variant: {args.model_type}) ...")
+    print(f"Loading model: {model_source} (variant: {args.model_type}) ...")
     from transformers import AutoModelForCausalLM
 
     model_load_kwargs = {"torch_dtype": torch_dtype}
@@ -1057,7 +1346,7 @@ def train(args: argparse.Namespace) -> None:
 
     try:
         base_model = AutoModelForCausalLM.from_pretrained(
-            args.model_name, **model_load_kwargs
+            model_source, **model_load_kwargs
         ).to(device)
     except Exception as exc:
         if model_load_kwargs.get("attn_implementation") == "flash_attention_2":
@@ -1067,7 +1356,7 @@ def train(args: argparse.Namespace) -> None:
             )
             model_load_kwargs.pop("attn_implementation", None)
             base_model = AutoModelForCausalLM.from_pretrained(
-                args.model_name, **model_load_kwargs
+                model_source, **model_load_kwargs
             ).to(device)
         else:
             raise
@@ -1082,11 +1371,11 @@ def train(args: argparse.Namespace) -> None:
         model = OnlineEBPModel(model=base_model, pool_type=args.pool_type)
 
     if args.gradient_checkpointing:
-        if args.compile_model and args.compile_fullgraph:
-            print("Skipping .gradient_checkpointing_enable() because --compile_fullgraph is set. Relying on torch.compile for memory optimization.")
-        else:
-            model.model.gradient_checkpointing_enable()
-            print("Gradient checkpointing enabled on generator model")
+        # gradient_checkpointing works on the raw HF model; training always uses
+        # _orig_mod (bypassing torch.compile), so fullgraph compilation of the
+        # generator and gradient checkpointing are orthogonal — always enable both.
+        model.model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled on generator model")
 
     if args.compile_model and hasattr(torch, "compile"):
         compile_mode = args.compile_mode
@@ -1094,23 +1383,63 @@ def train(args: argparse.Namespace) -> None:
             compile_mode = "default" if args.memory_constrained else "reduce-overhead"
 
         try:
-            # Use reduce-overhead to enable CUDA Graphs within reachable subgraphs.
-            # fullgraph=False is safer for the HuggingFace model wrapper itself,
-            # as it contains non-compilable elements like hooks and locks.
+            if args.compile_fullgraph:
+                # HF's maybe_install_capturing_hooks acquires a threading lock
+                # which Dynamo cannot trace under fullgraph=True (graph break).
+                # Suppress it only during Dynamo tracing; let it run normally at
+                # runtime so output_hidden_states=True keeps working for raw_model
+                # calls (features extraction uses hooks to collect hidden states).
+                import transformers.utils.output_capturing as _oc
+                _orig_install_hooks = _oc.maybe_install_capturing_hooks
+                def _maybe_install_hooks_safe(module):
+                    if torch.compiler.is_compiling():
+                        return
+                    return _orig_install_hooks(module)
+                _oc.maybe_install_capturing_hooks = _maybe_install_hooks_safe
+
+                # transformers/masking_utils.py:flash_attention_mask contains
+                # `if attention_mask.all():` — a data-dependent Python branch that
+                # Dynamo cannot trace under fullgraph=True. Patch it to always
+                # return the sliced mask; FA2 handles non-None masks correctly
+                # (same attention pattern, just uses explicit mask instead of
+                # is_causal shortcut, which is fine for our use case).
+                import transformers.masking_utils as _mu
+                # Always return None so FlashAttention uses the padded (non-varlen)
+                # path inside the compiled model. The varlen path calls
+                # torch.nonzero (data-dependent output shape) and seqlens.max().item()
+                # (data-dependent scalar); both cause Dynamo to recompile for every
+                # distinct effective sequence length, overflowing cache_size_limit and
+                # either hanging in compile churn or OOMing during Triton codegen.
+                # Returning None forces causal-only attention (no explicit padding
+                # mask). For packed training sequences this is identical; for padded
+                # validation contexts it attends over pad tokens — acceptable since
+                # the causal mask already prevents future-token leakage, and the minor
+                # quality impact on validation metrics does not affect training.
+                def _flash_attention_mask_fullgraph(
+                    batch_size, q_length, kv_length,
+                    q_offset=0, kv_offset=0,
+                    mask_function=None, attention_mask=None, **kwargs
+                ):
+                    return None
+                _mu.flash_attention_mask = _flash_attention_mask_fullgraph
+                # ALL_MASK_ATTENTION_FUNCTIONS holds the reference captured at
+                # import time — must patch the dict too, not just the module attr.
+                for _k in list(_mu.ALL_MASK_ATTENTION_FUNCTIONS):
+                    if "flash" in _k:
+                        _mu.ALL_MASK_ATTENTION_FUNCTIONS[_k] = _flash_attention_mask_fullgraph
+
+            # With fullgraph=False, Dynamo allows graph breaks at HF's
+            # Python-level constructs (output_capturing hooks, masking
+            # branches). The generate() loop stays in Python; each model
+            # forward call runs compiled kernels via the StaticCache path.
+            # cache_size_limit=64 ensures all 28 layer_idx traces are cached
+            # so there is no eager fallback after warmup.
             model.model = torch.compile(
                 model.model,
                 mode=compile_mode,
-                fullgraph=False,
+                fullgraph=args.compile_fullgraph,
             )
-            print(f"Enabled torch.compile for generator (mode={compile_mode}, fullgraph=False)")
-
-            # The training kernel performs forward, rewards, and backward.
-            # While isolated, it still calls the HuggingFace model, which contains 
-            # Python locks (e.g., in transformers.utils.output_capturing) that 
-            # prevent 'fullgraph=True' capture. 
-            # We use fullgraph=False with 'reduce-overhead' to ensure that 
-            # all graphable subgraphs (including most of the model) are still 
-            # compiled into CUDA graphs, achieving the requested performance.
+            print(f"Enabled torch.compile for generator (mode={compile_mode}, fullgraph={args.compile_fullgraph})")
             global _train_kernel
             _train_kernel = torch.compile(
                 _train_kernel,
@@ -1129,6 +1458,11 @@ def train(args: argparse.Namespace) -> None:
     if args.val_split == args.dataset_split:
         val_skip_docs = args.max_val_docs
         print(f"Carving out {val_skip_docs} documents from {args.dataset_split} split for validation")
+
+    if args.tokenized is None:
+        args.tokenized = os.path.isdir(args.dataset_name)
+        print(f"--tokenized not specified; auto-detected tokenized={args.tokenized} "
+              f"({'directory' if args.tokenized else 'not a directory'}: {args.dataset_name})")
 
     print(f"Loading dataset: {args.dataset_name} ...")
     dataset = PretrainingDataset(
@@ -1275,7 +1609,8 @@ def train(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     def _lr_lambda(step: int) -> float:
         if args.warmup_steps > 0 and step < args.warmup_steps:
-            return step / args.warmup_steps
+            # (step + 1) so the very first update has a non-zero LR.
+            return (step + 1) / args.warmup_steps
         progress = (step - args.warmup_steps) / max(1, args.max_steps - args.warmup_steps)
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
@@ -1295,6 +1630,24 @@ def train(args: argparse.Namespace) -> None:
     model.train()
     metrics_history: List[dict] = []
 
+    if args.resume_from_checkpoint:
+        state_path = os.path.join(args.resume_from_checkpoint, "training_state.pt")
+        if os.path.exists(state_path):
+            state = torch.load(state_path, map_location=device)
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            step = state["step"]
+            if isinstance(model, EMAEBPModel):
+                if "ema" in state:
+                    model.ema_model.load_state_dict(state["ema"])
+                    print("Restored EMA feature-network weights from checkpoint")
+                else:
+                    print("Warning: checkpoint has no EMA weights; "
+                          "re-initialising the feature network from the generator")
+            print(f"Resumed from checkpoint: {args.resume_from_checkpoint} (step {step})")
+        else:
+            print(f"Warning: no training_state.pt in {args.resume_from_checkpoint}; starting optimizer from scratch at step 0")
+
     if args.ce_only:
         print("Using CE-only training step (continued pretraining baseline)")
         step_fn = ce_training_step
@@ -1307,6 +1660,15 @@ def train(args: argparse.Namespace) -> None:
         print("Using regular training step (single backward, CE/ref after rollouts)")
         step_fn = training_step
         validation_fn = validation_epoch
+
+    if not args.ce_only:
+        print(
+            f"Objective: REINFORCE + {args.gamma} * CE"
+            + (f" + {args.sigreg_weight} * SIGReg[{args.sigreg_mode}]"
+               if args.sigreg_weight > 0 else "")
+            + f"  (loss_agg={args.loss_agg}, min_reward_std={args.min_reward_std}, "
+            f"whitening={args.whitening})"
+        )
 
     if args.grad_accum_steps > 1:
         print(f"Gradient accumulation: {args.grad_accum_steps} steps "
@@ -1326,8 +1688,17 @@ def train(args: argparse.Namespace) -> None:
                 "gamma": args.gamma,
                 "temperature": args.temperature,
                 "whitening": args.whitening,
+                "min_reward_std": args.min_reward_std,
+                "loss_agg": args.loss_agg,
+                "sigreg_weight": args.sigreg_weight,
+                "sigreg_mode": args.sigreg_mode,
+                "sigreg_positions": args.sigreg_positions,
+                "sigreg_slices": args.sigreg_slices,
+                "sigreg_sketch_dim": args.sigreg_sketch_dim,
             }
         )
+    if args.memory_constrained and getattr(args, "rollout_chunk_size", None) is not None:
+        base_step_kwargs["rollout_chunk_size"] = args.rollout_chunk_size
 
     base_val_kwargs: Dict[str, object] = {
         "model": model,
@@ -1343,16 +1714,20 @@ def train(args: argparse.Namespace) -> None:
                 "gamma": args.gamma,
                 "temperature": args.temperature,
                 "whitening": args.whitening,
+                "min_reward_std": args.min_reward_std,
+                "loss_agg": args.loss_agg,
             }
         )
+    if getattr(args, "rollout_chunk_size", None) is not None:
+        base_val_kwargs["rollout_chunk_size"] = args.rollout_chunk_size
 
     prefetched_loader = GPUPrefetcher(dataloader, device)
     loss_scale = 1.0 / args.grad_accum_steps
 
     # ------------------------------------------------------------------
-    # Baseline validation
+    # Baseline validation (skipped on resume)
     # ------------------------------------------------------------------
-    if val_dataloader is not None:
+    if val_dataloader is not None and step == 0:
         print("Running baseline validation (step 0)...")
         baseline_val_start = time.perf_counter()
         val_res = validation_fn(**base_val_kwargs)
@@ -1382,6 +1757,15 @@ def train(args: argparse.Namespace) -> None:
     optimizer.zero_grad(set_to_none=True)
     accum_count = 0
     accum_results: List[dict] = []
+
+    if step > 0:
+        # Fast-forward the dataloader past already-seen batches.
+        skip = step * args.grad_accum_steps
+        print(f"Skipping {skip} batches to resume at step {step}...")
+        import itertools
+        for _ in itertools.islice(prefetched_loader, skip):
+            pass
+        print("Fast-forward complete.")
 
     while step < args.max_steps:
         for batch in prefetched_loader:
@@ -1453,6 +1837,9 @@ def train(args: argparse.Namespace) -> None:
                         f"opt={mem.get('opt_step_alloc_mb', 0.0):.0f}/{mem.get('opt_step_reserved_mb', 0.0):.0f}"
                     )
 
+            if step % 200 == 0 and device.type == "cuda":
+                torch.cuda.empty_cache()
+
             if step % args.val_steps == 0 and val_dataloader is not None:
                 print(f"Running validation at step {step}...")
                 val_res = validation_fn(**base_val_kwargs)
@@ -1476,8 +1863,20 @@ def train(args: argparse.Namespace) -> None:
 
             if step % args.save_steps == 0:
                 save_path = os.path.join(args.output_dir, f"step_{step}")
+                torch.cuda.empty_cache()
                 model.model.save_pretrained(save_path)
                 tokenizer.save_pretrained(save_path)
+                training_state = {
+                    "step": step,
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                }
+                if isinstance(model, EMAEBPModel):
+                    # The EMA feature network is not recoverable from the saved
+                    # generator weights; without it a resumed run restarts the
+                    # feature network from the current generator.
+                    training_state["ema"] = model.ema_model.state_dict()
+                torch.save(training_state, os.path.join(save_path, "training_state.pt"))
                 print(f"Saved checkpoint to {save_path}")
                 # Also persist metrics so far
                 with open(metrics_file, "wb") as fh:

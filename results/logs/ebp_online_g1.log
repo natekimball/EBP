@@ -1,0 +1,229 @@
+Using device: cuda
+Enabled Tensor Core acceleration (TF32 matmul/cudnn) for compute capability 8.6
+Using dtype: torch.bfloat16
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading model: Qwen/Qwen3-0.6B-Base (variant: online) ...
+Requesting FlashAttention v2 kernels for model attention
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+FlashAttention request failed; falling back to model default attention implementation. Reason: FlashAttention2 has been toggled on, but it cannot be used due to the following error: the package for FlashAttention2 doesn't seem to be installed.
+Loading weights:   0%|          | 0/310 [00:00<?, ?it/s]Loading weights: 100%|██████████| 310/310 [00:00<00:00, 12866.60it/s]
+Gradient checkpointing enabled on generator model
+Carving out 500 documents from train split for validation
+--tokenized not specified; auto-detected tokenized=False (not a directory: open-web-math/open-web-math)
+Loading dataset: open-web-math/open-web-math ...
+Train dataset loaded
+Creating validation set from first 500 documents of train split...
+Validation dataset loaded
+Validation batch size: 8
+DataLoader settings: pin_memory=True, num_workers=4, persistent_workers=True, prefetch_factor=2
+Using fused AdamW CUDA kernels
+LR scheduler: 100 warmup steps then cosine decay to 0
+Using memory-constrained training step (early CE backward)
+Objective: REINFORCE + 1.0 * CE  (loss_agg=token, min_reward_std=0.0, whitening=False)
+Running baseline validation (step 0)...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Baseline validation duration: 18.95s
+Step      0 [VAL] | loss=2.0286 reinforce=-0.0164 ce=2.0449 reward=0.0083 nll=1.6499
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step     25 | loss=2.0374 reinforce=0.0254 ce=2.0119 reward=-0.2461 align=2.8438 div=3.0938 nll=1.8431 lr=2.60e-06
+Step     50 | loss=1.8497 reinforce=0.0269 ce=1.8228 reward=-0.1235 align=2.9688 div=3.0938 nll=1.1320 lr=5.10e-06
+Step     75 | loss=3.6501 reinforce=-0.0050 ce=3.6551 reward=-0.0330 align=2.8125 div=2.8438 nll=2.6987 lr=7.60e-06
+Step    100 | loss=1.8405 reinforce=0.0406 ce=1.7999 reward=0.1299 align=3.2500 div=3.1250 nll=1.3396 lr=1.00e-05
+Step    125 | loss=3.5867 reinforce=-0.0345 ce=3.6212 reward=-0.3203 align=2.5625 div=2.8750 nll=1.8090 lr=1.00e-05
+Step    150 | loss=1.8073 reinforce=0.0146 ce=1.7927 reward=0.1777 align=2.9688 div=2.7969 nll=1.5166 lr=9.99e-06
+Step    175 | loss=2.6092 reinforce=0.0444 ce=2.5648 reward=-0.2578 align=2.6094 div=2.8750 nll=2.0167 lr=9.98e-06
+Step    200 | loss=1.3939 reinforce=0.0241 ce=1.3698 reward=0.3203 align=4.5625 div=4.2500 nll=1.0085 lr=9.97e-06
+Step    225 | loss=1.8574 reinforce=0.1533 ce=1.7041 reward=-0.4727 align=2.8750 div=3.3438 nll=0.8385 lr=9.95e-06
+Step    250 | loss=2.3090 reinforce=-0.0382 ce=2.3472 reward=0.4062 align=3.1406 div=2.7344 nll=1.3761 lr=9.93e-06
+Running validation at step 250...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step    250 [VAL] | loss=2.0067 reinforce=-0.0324 ce=2.0391 reward=-0.0871 nll=1.6556
+Step    275 | loss=3.0265 reinforce=0.0360 ce=2.9906 reward=0.1211 align=2.7344 div=2.6094 nll=2.4296 lr=9.91e-06
+Step    300 | loss=2.0922 reinforce=-0.0165 ce=2.1087 reward=-0.3262 align=2.4219 div=2.7500 nll=1.7714 lr=9.88e-06
+Step    325 | loss=1.3914 reinforce=0.0117 ce=1.3796 reward=-0.2129 align=2.7656 div=2.9688 nll=1.2498 lr=9.85e-06
+Step    350 | loss=2.0305 reinforce=0.0637 ce=1.9668 reward=-0.2275 align=3.7812 div=4.0000 nll=1.2971 lr=9.82e-06
+Step    375 | loss=2.3814 reinforce=0.0280 ce=2.3534 reward=0.0144 align=2.7344 div=2.7188 nll=2.0476 lr=9.78e-06
+Step    400 | loss=1.8991 reinforce=0.0345 ce=1.8645 reward=-0.6953 align=2.6719 div=3.3750 nll=1.1239 lr=9.74e-06
+Step    425 | loss=1.8855 reinforce=0.0213 ce=1.8642 reward=-0.3066 align=4.1250 div=4.4062 nll=0.9067 lr=9.69e-06
+Step    450 | loss=2.2118 reinforce=-0.0462 ce=2.2580 reward=-0.0322 align=2.9688 div=3.0000 nll=1.6158 lr=9.64e-06
+Step    475 | loss=3.3827 reinforce=0.0210 ce=3.3617 reward=0.2236 align=3.0781 div=2.8594 nll=2.1599 lr=9.59e-06
+Step    500 | loss=2.6296 reinforce=0.0852 ce=2.5444 reward=-0.1455 align=2.5156 div=2.6562 nll=1.6921 lr=9.54e-06
+Running validation at step 500...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step    500 [VAL] | loss=1.9830 reinforce=-0.0520 ce=2.0350 reward=-0.0025 nll=1.6208
+Step    525 | loss=1.3597 reinforce=0.0106 ce=1.3491 reward=-0.3047 align=3.7188 div=4.0312 nll=0.6733 lr=9.48e-06
+Step    550 | loss=1.6523 reinforce=-0.0505 ce=1.7028 reward=0.3477 align=4.8125 div=4.4688 nll=0.8584 lr=9.42e-06
+Step    575 | loss=2.9492 reinforce=0.0166 ce=2.9326 reward=0.0132 align=2.9844 div=2.9844 nll=1.8567 lr=9.35e-06
+Step    600 | loss=2.6206 reinforce=-0.1749 ce=2.7955 reward=-0.0378 align=2.6406 div=2.6875 nll=2.0850 lr=9.28e-06
+Step    625 | loss=1.9988 reinforce=-0.0024 ce=2.0012 reward=-0.2988 align=2.0781 div=2.3750 nll=1.7695 lr=9.21e-06
+Step    650 | loss=1.8871 reinforce=0.0172 ce=1.8699 reward=-0.3535 align=3.0625 div=3.4219 nll=1.3250 lr=9.14e-06
+Step    675 | loss=1.9035 reinforce=-0.0171 ce=1.9206 reward=-0.0259 align=3.4531 div=3.4688 nll=1.5923 lr=9.06e-06
+Step    700 | loss=2.9506 reinforce=0.3354 ce=2.6152 reward=-0.6445 align=2.3750 div=3.0156 nll=1.4399 lr=8.98e-06
+Step    725 | loss=1.4522 reinforce=0.1218 ce=1.3304 reward=-0.1836 align=3.0000 div=3.1875 nll=1.0020 lr=8.90e-06
+Step    750 | loss=1.6236 reinforce=-0.0466 ce=1.6702 reward=0.0232 align=3.4531 div=3.4375 nll=0.8662 lr=8.81e-06
+Running validation at step 750...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step    750 [VAL] | loss=1.9868 reinforce=-0.0446 ce=2.0314 reward=-0.0504 nll=1.6466
+Step    775 | loss=1.9749 reinforce=-0.0782 ce=2.0530 reward=0.1318 align=3.2188 div=3.0781 nll=1.4114 lr=8.72e-06
+Step    800 | loss=1.7932 reinforce=0.0784 ce=1.7149 reward=-0.0366 align=2.4219 div=2.4531 nll=1.6235 lr=8.63e-06
+Step    825 | loss=0.8568 reinforce=-0.0150 ce=0.8719 reward=-0.1494 align=4.9375 div=5.0938 nll=0.3523 lr=8.54e-06
+Step    850 | loss=1.5543 reinforce=-0.0147 ce=1.5691 reward=0.0884 align=3.4531 div=3.3594 nll=0.8525 lr=8.44e-06
+Step    875 | loss=1.1210 reinforce=0.0806 ce=1.0404 reward=-0.1094 align=3.9844 div=4.0938 nll=0.9966 lr=8.34e-06
+Step    900 | loss=0.9832 reinforce=-0.0570 ce=1.0402 reward=0.4277 align=5.0312 div=4.6250 nll=0.1592 lr=8.24e-06
+Step    925 | loss=2.7353 reinforce=0.0182 ce=2.7171 reward=-0.1680 align=2.7031 div=2.8750 nll=2.0422 lr=8.13e-06
+Step    950 | loss=1.6385 reinforce=-0.0706 ce=1.7091 reward=0.2754 align=3.7188 div=3.4375 nll=1.1084 lr=8.03e-06
+Step    975 | loss=2.7363 reinforce=0.0107 ce=2.7256 reward=-0.1553 align=2.5312 div=2.6875 nll=2.2627 lr=7.92e-06
+Step   1000 | loss=1.6275 reinforce=0.0243 ce=1.6032 reward=0.0259 align=4.0625 div=4.0312 nll=0.5872 lr=7.81e-06
+Running validation at step 1000...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step   1000 [VAL] | loss=2.0155 reinforce=-0.0132 ce=2.0287 reward=-0.0619 nll=1.6421
+Step   1025 | loss=2.4612 reinforce=-0.1619 ce=2.6231 reward=-0.0972 align=2.5938 div=2.7031 nll=1.9741 lr=7.69e-06
+Step   1050 | loss=2.8189 reinforce=0.0300 ce=2.7889 reward=-0.1562 align=2.4531 div=2.6094 nll=2.3287 lr=7.58e-06
+Step   1075 | loss=1.2426 reinforce=-0.0657 ce=1.3083 reward=0.3574 align=3.6562 div=3.2969 nll=1.0912 lr=7.46e-06
+Step   1100 | loss=1.8406 reinforce=0.0117 ce=1.8289 reward=-0.0801 align=2.8281 div=2.9062 nll=1.1370 lr=7.34e-06
+Step   1125 | loss=2.1042 reinforce=-0.0088 ce=2.1130 reward=-0.0723 align=3.1406 div=3.2188 nll=1.5374 lr=7.22e-06
+Step   1150 | loss=2.7417 reinforce=-0.1194 ce=2.8611 reward=0.1416 align=3.7188 div=3.5781 nll=1.7095 lr=7.10e-06
+Step   1175 | loss=2.5574 reinforce=0.0319 ce=2.5255 reward=0.3887 align=3.1719 div=2.7812 nll=1.9958 lr=6.98e-06
+Step   1200 | loss=2.2681 reinforce=0.0897 ce=2.1783 reward=-0.2949 align=2.4375 div=2.7344 nll=1.8220 lr=6.85e-06
+Step   1225 | loss=1.5299 reinforce=-0.0429 ce=1.5728 reward=0.1118 align=3.1562 div=3.0469 nll=1.2236 lr=6.72e-06
+Step   1250 | loss=2.6531 reinforce=-0.0779 ce=2.7310 reward=-0.2422 align=2.3750 div=2.6250 nll=1.7786 lr=6.60e-06
+Running validation at step 1250...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step   1250 [VAL] | loss=2.0108 reinforce=-0.0161 ce=2.0269 reward=-0.1515 nll=1.6090
+Step   1275 | loss=2.6423 reinforce=0.0056 ce=2.6367 reward=0.0723 align=2.7812 div=2.7188 nll=1.7805 lr=6.47e-06
+Step   1300 | loss=2.3913 reinforce=-0.0385 ce=2.4298 reward=0.1592 align=2.9219 div=2.7500 nll=2.1309 lr=6.34e-06
+Step   1325 | loss=2.4468 reinforce=-0.0117 ce=2.4586 reward=-0.0347 align=3.0625 div=3.0938 nll=2.4363 lr=6.21e-06
+Step   1350 | loss=1.6142 reinforce=-0.0902 ce=1.7044 reward=0.1660 align=2.8594 div=2.6875 nll=1.8628 lr=6.07e-06
+Step   1375 | loss=1.8451 reinforce=0.0060 ce=1.8392 reward=0.2168 align=2.8438 div=2.6406 nll=1.1429 lr=5.94e-06
+Step   1400 | loss=1.9357 reinforce=0.0043 ce=1.9314 reward=-0.1377 align=2.8906 div=3.0312 nll=1.6921 lr=5.81e-06
+Step   1425 | loss=1.3404 reinforce=0.0356 ce=1.3049 reward=-0.1123 align=2.4062 div=2.5156 nll=0.9810 lr=5.68e-06
+Step   1450 | loss=1.7920 reinforce=0.0277 ce=1.7643 reward=0.0173 align=3.0000 div=2.9844 nll=1.3691 lr=5.54e-06
+Step   1475 | loss=2.3775 reinforce=0.0312 ce=2.3464 reward=0.0684 align=3.0781 div=3.0156 nll=2.0684 lr=5.41e-06
+Step   1500 | loss=1.3623 reinforce=-0.0291 ce=1.3914 reward=0.3887 align=3.8750 div=3.4844 nll=0.7919 lr=5.27e-06
+Running validation at step 1500...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step   1500 [VAL] | loss=2.0189 reinforce=-0.0082 ce=2.0270 reward=-0.0983 nll=1.5852
+Writing model shards:   0%|          | 0/1 [00:00<?, ?it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.27it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.27it/s]
+Saved checkpoint to /workspace/run/ebp_g1/step_1500
+Metrics saved to /workspace/run/ebp_g1/metrics.pkl
+Step   1525 | loss=1.8130 reinforce=-0.1147 ce=1.9277 reward=0.3164 align=3.2188 div=2.9062 nll=1.7246 lr=5.14e-06
+Step   1550 | loss=1.6215 reinforce=0.0169 ce=1.6046 reward=0.0693 align=4.9062 div=4.8438 nll=0.5996 lr=5.00e-06
+Step   1575 | loss=3.6167 reinforce=0.0014 ce=3.6153 reward=0.2070 align=2.7656 div=2.5469 nll=2.5994 lr=4.86e-06
+Step   1600 | loss=2.4755 reinforce=-0.0283 ce=2.5038 reward=-0.1758 align=2.6875 div=2.8594 nll=2.2068 lr=4.73e-06
+Step   1625 | loss=2.6468 reinforce=0.0006 ce=2.6461 reward=0.1436 align=2.9062 div=2.7500 nll=1.9594 lr=4.59e-06
+Step   1650 | loss=2.4441 reinforce=-0.0292 ce=2.4734 reward=-0.0076 align=2.6875 div=2.7031 nll=2.2822 lr=4.46e-06
+Step   1675 | loss=2.4650 reinforce=0.1544 ce=2.3106 reward=0.0820 align=2.7500 div=2.6719 nll=1.9576 lr=4.32e-06
+Step   1700 | loss=1.3301 reinforce=-0.0105 ce=1.3405 reward=0.0996 align=3.5625 div=3.4688 nll=1.0374 lr=4.19e-06
+Step   1725 | loss=2.2152 reinforce=-0.0029 ce=2.2182 reward=0.1699 align=2.7812 div=2.6250 nll=1.8823 lr=4.06e-06
+Step   1750 | loss=2.7727 reinforce=-0.0093 ce=2.7820 reward=0.0376 align=2.6875 div=2.6562 nll=2.4495 lr=3.93e-06
+Running validation at step 1750...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step   1750 [VAL] | loss=2.0139 reinforce=-0.0134 ce=2.0273 reward=-0.1886 nll=1.6377
+Step   1775 | loss=2.7040 reinforce=-0.0471 ce=2.7511 reward=0.1187 align=3.0000 div=2.8750 nll=2.0027 lr=3.79e-06
+Step   1800 | loss=2.6652 reinforce=-0.0651 ce=2.7303 reward=0.0742 align=3.2031 div=3.1250 nll=1.7522 lr=3.66e-06
+Step   1825 | loss=1.6208 reinforce=0.0939 ce=1.5269 reward=-0.5664 align=3.1719 div=3.7344 nll=1.1597 lr=3.53e-06
+Step   1850 | loss=1.7981 reinforce=-0.0151 ce=1.8133 reward=-0.2393 align=2.5625 div=2.8125 nll=1.7996 lr=3.40e-06
+Step   1875 | loss=3.2920 reinforce=-0.0260 ce=3.3180 reward=-0.3652 align=2.6875 div=3.0469 nll=2.4025 lr=3.28e-06
+Step   1900 | loss=2.0190 reinforce=0.0717 ce=1.9473 reward=-0.6250 align=2.3906 div=3.0312 nll=1.4347 lr=3.15e-06
+Step   1925 | loss=1.9594 reinforce=0.0079 ce=1.9515 reward=0.2305 align=3.1250 div=2.8906 nll=1.5840 lr=3.02e-06
+Step   1950 | loss=1.7038 reinforce=-0.0067 ce=1.7104 reward=0.0215 align=2.8750 div=2.8594 nll=1.2345 lr=2.90e-06
+Step   1975 | loss=3.0183 reinforce=-0.0315 ce=3.0499 reward=0.1387 align=3.0938 div=2.9531 nll=1.8672 lr=2.78e-06
+Step   2000 | loss=2.0679 reinforce=-0.0437 ce=2.1116 reward=-0.1514 align=3.0156 div=3.1719 nll=1.7814 lr=2.66e-06
+Running validation at step 2000...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step   2000 [VAL] | loss=2.0061 reinforce=-0.0201 ce=2.0262 reward=-0.0431 nll=1.5914
+Step   2025 | loss=1.2541 reinforce=-0.0667 ce=1.3208 reward=0.1533 align=3.8594 div=3.7031 nll=0.9569 lr=2.54e-06
+Step   2050 | loss=1.9842 reinforce=-0.0640 ce=2.0482 reward=-0.0608 align=2.8750 div=2.9375 nll=1.7041 lr=2.42e-06
+Step   2075 | loss=1.9012 reinforce=-0.0604 ce=1.9616 reward=-0.0159 align=3.0156 div=3.0312 nll=1.8433 lr=2.31e-06
+Step   2100 | loss=3.4616 reinforce=0.0540 ce=3.4076 reward=-0.1030 align=3.0000 div=3.0938 nll=2.2986 lr=2.19e-06
+Step   2125 | loss=1.5990 reinforce=0.0716 ce=1.5274 reward=-0.1826 align=3.2656 div=3.4531 nll=0.8232 lr=2.08e-06
+Step   2150 | loss=2.1011 reinforce=-0.0119 ce=2.1131 reward=-0.5156 align=3.4688 div=3.9844 nll=1.1954 lr=1.97e-06
+Step   2175 | loss=1.3080 reinforce=-0.0341 ce=1.3421 reward=0.1113 align=2.8906 div=2.7656 nll=1.4558 lr=1.87e-06
+Step   2200 | loss=2.6594 reinforce=-0.0088 ce=2.6682 reward=0.2148 align=2.7969 div=2.5938 nll=1.9465 lr=1.76e-06
+Step   2225 | loss=1.4740 reinforce=0.1270 ce=1.3470 reward=-0.0566 align=4.6875 div=4.7500 nll=0.8785 lr=1.66e-06
+Step   2250 | loss=3.7237 reinforce=0.0098 ce=3.7139 reward=-0.4707 align=2.2500 div=2.7188 nll=2.4478 lr=1.56e-06
+Running validation at step 2250...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step   2250 [VAL] | loss=1.9664 reinforce=-0.0594 ce=2.0258 reward=-0.0300 nll=1.5987
+Step   2275 | loss=3.5788 reinforce=0.1858 ce=3.3930 reward=-0.4258 align=2.5312 div=2.9531 nll=1.8826 lr=1.46e-06
+Step   2300 | loss=1.4637 reinforce=0.0343 ce=1.4294 reward=-0.3457 align=2.7969 div=3.1406 nll=0.9982 lr=1.37e-06
+Step   2325 | loss=2.2742 reinforce=0.0235 ce=2.2507 reward=-0.5273 align=2.4375 div=2.9688 nll=1.5823 lr=1.28e-06
+Step   2350 | loss=1.9835 reinforce=0.0022 ce=1.9813 reward=0.1147 align=2.9844 div=2.8750 nll=1.7499 lr=1.19e-06
+Step   2375 | loss=2.1507 reinforce=0.0428 ce=2.1079 reward=-0.6641 align=2.0781 div=2.7500 nll=1.6948 lr=1.10e-06
+Step   2400 | loss=1.7194 reinforce=-0.0196 ce=1.7390 reward=0.0088 align=3.1719 div=3.1719 nll=1.3872 lr=1.02e-06
+Step   2425 | loss=2.5204 reinforce=0.0435 ce=2.4769 reward=-0.0493 align=2.8594 div=2.9062 nll=1.4517 lr=9.39e-07
+Step   2450 | loss=2.8653 reinforce=-0.0013 ce=2.8666 reward=-0.0757 align=2.6094 div=2.6875 nll=2.0782 lr=8.62e-07
+Step   2475 | loss=2.2551 reinforce=0.0638 ce=2.1913 reward=0.1709 align=3.3438 div=3.1719 nll=1.2808 lr=7.87e-07
+Step   2500 | loss=2.3038 reinforce=-0.0247 ce=2.3285 reward=-0.4902 align=2.7344 div=3.2344 nll=2.1040 lr=7.16e-07
+Running validation at step 2500...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step   2500 [VAL] | loss=2.0049 reinforce=-0.0210 ce=2.0259 reward=-0.0711 nll=1.6749
+Step   2525 | loss=2.1702 reinforce=-0.0396 ce=2.2098 reward=0.0488 align=3.8750 div=3.8281 nll=1.0426 lr=6.47e-07
+Step   2550 | loss=3.1801 reinforce=0.0477 ce=3.1323 reward=0.0249 align=2.8906 div=2.8750 nll=2.4346 lr=5.82e-07
+Step   2575 | loss=1.5017 reinforce=-0.0546 ce=1.5563 reward=0.2070 align=3.1250 div=2.9219 nll=1.5333 lr=5.21e-07
+Step   2600 | loss=1.6310 reinforce=-0.0592 ce=1.6901 reward=-0.1406 align=2.7812 div=2.9219 nll=1.6482 lr=4.62e-07
+Step   2625 | loss=2.0073 reinforce=-0.0062 ce=2.0135 reward=-0.2598 align=2.5156 div=2.7656 nll=1.6542 lr=4.07e-07
+Step   2650 | loss=0.5944 reinforce=-0.0687 ce=0.6631 reward=0.3008 align=4.9375 div=4.6250 nll=0.2925 lr=3.55e-07
+Step   2675 | loss=1.7779 reinforce=-0.0766 ce=1.8545 reward=-0.0479 align=2.9219 div=2.9688 nll=1.8474 lr=3.07e-07
+Step   2700 | loss=1.7790 reinforce=-0.0994 ce=1.8785 reward=0.3594 align=3.8438 div=3.4844 nll=1.3326 lr=2.62e-07
+Step   2725 | loss=3.2452 reinforce=-0.0784 ce=3.3236 reward=-0.6680 align=2.1719 div=2.8438 nll=2.4219 lr=2.20e-07
+Step   2750 | loss=0.1320 reinforce=-0.0029 ce=0.1349 reward=0.0952 align=5.9062 div=5.8125 nll=0.0188 lr=1.82e-07
+Running validation at step 2750...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step   2750 [VAL] | loss=1.9937 reinforce=-0.0317 ce=2.0254 reward=0.0083 nll=1.5768
+Step   2775 | loss=2.3468 reinforce=-0.0258 ce=2.3726 reward=-0.3867 align=2.7812 div=3.1719 nll=1.9785 lr=1.48e-07
+Step   2800 | loss=2.0960 reinforce=0.1109 ce=1.9851 reward=0.0120 align=2.5000 div=2.4844 nll=1.9861 lr=1.17e-07
+Step   2825 | loss=1.2760 reinforce=-0.1554 ce=1.4314 reward=0.5312 align=3.6406 div=3.1094 nll=1.1648 lr=8.96e-08
+Step   2850 | loss=2.1757 reinforce=0.0639 ce=2.1118 reward=0.4219 align=2.9844 div=2.5625 nll=1.5864 lr=6.59e-08
+Step   2875 | loss=2.3721 reinforce=0.0398 ce=2.3323 reward=-0.3457 align=2.3906 div=2.7344 nll=1.7606 lr=4.58e-08
+Step   2900 | loss=2.5725 reinforce=0.1417 ce=2.4308 reward=-0.0566 align=2.5000 div=2.5625 nll=2.1462 lr=2.93e-08
+Step   2925 | loss=2.7697 reinforce=-0.0085 ce=2.7782 reward=0.0391 align=2.8438 div=2.8125 nll=1.8663 lr=1.65e-08
+Step   2950 | loss=1.5827 reinforce=0.0705 ce=1.5122 reward=-0.0996 align=2.5781 div=2.6719 nll=1.3315 lr=7.33e-09
+Step   2975 | loss=0.3034 reinforce=-0.0529 ce=0.3563 reward=0.3359 align=5.5625 div=5.2188 nll=0.3477 lr=1.83e-09
+Step   3000 | loss=3.4343 reinforce=-0.0121 ce=3.4464 reward=0.0547 align=2.7656 div=2.7031 nll=2.7123 lr=0.00e+00
+Running validation at step 3000...
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step   3000 [VAL] | loss=1.9881 reinforce=-0.0379 ce=2.0260 reward=-0.0248 nll=1.6368
+Writing model shards:   0%|          | 0/1 [00:00<?, ?it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.35it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.35it/s]
+Saved checkpoint to /workspace/run/ebp_g1/step_3000
+Metrics saved to /workspace/run/ebp_g1/metrics.pkl
+Writing model shards:   0%|          | 0/1 [00:00<?, ?it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.82it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.81it/s]
+Training complete. Final model saved to /workspace/run/ebp_g1/final
+Metrics history saved to /workspace/run/ebp_g1/metrics.pkl

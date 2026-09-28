@@ -1,0 +1,228 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Using device: cuda
+Enabled Tensor Core acceleration (TF32 matmul/cudnn) for compute capability 8.6
+Using dtype: torch.bfloat16
+Loading model: Qwen/Qwen3-0.6B-Base (variant: online) ...
+Requesting FlashAttention v2 kernels for model attention
+FlashAttention request failed; falling back to model default attention implementation. Reason: FlashAttention2 has been toggled on, but it cannot be used due to the following error: the package for FlashAttention2 doesn't seem to be installed.
+Loading weights:   0%|          | 0/310 [00:00<?, ?it/s]Loading weights: 100%|██████████| 310/310 [00:00<00:00, 9786.43it/s]
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Gradient checkpointing enabled on generator model
+Carving out 500 documents from train split for validation
+--tokenized not specified; auto-detected tokenized=False (not a directory: open-web-math/open-web-math)
+Loading dataset: open-web-math/open-web-math ...
+Train dataset loaded
+Creating validation set from first 500 documents of train split...
+Validation dataset loaded
+Validation batch size: 8
+DataLoader settings: pin_memory=True, num_workers=4, persistent_workers=True, prefetch_factor=2
+Using fused AdamW CUDA kernels
+LR scheduler: 100 warmup steps then cosine decay to 0
+Using CE-only training step (continued pretraining baseline)
+Running baseline validation (step 0)...
+Baseline validation duration: 10.40s
+Step      0 [VAL] | loss=2.0449 ce=2.0449
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Step     25 | loss=2.0127 ce=2.0127 lr=2.60e-06
+Step     50 | loss=1.8225 ce=1.8225 lr=5.10e-06
+Step     75 | loss=3.6554 ce=3.6554 lr=7.60e-06
+Step    100 | loss=1.7985 ce=1.7985 lr=1.00e-05
+Step    125 | loss=3.6186 ce=3.6186 lr=1.00e-05
+Step    150 | loss=1.7895 ce=1.7895 lr=9.99e-06
+Step    175 | loss=2.5654 ce=2.5654 lr=9.98e-06
+Step    200 | loss=1.3699 ce=1.3699 lr=9.97e-06
+Step    225 | loss=1.6976 ce=1.6976 lr=9.95e-06
+Step    250 | loss=2.3427 ce=2.3427 lr=9.93e-06
+Running validation at step 250...
+Step    250 [VAL] | loss=2.0378 ce=2.0378
+Step    275 | loss=2.9875 ce=2.9875 lr=9.91e-06
+Step    300 | loss=2.1060 ce=2.1060 lr=9.88e-06
+Step    325 | loss=1.3787 ce=1.3787 lr=9.85e-06
+Step    350 | loss=1.9619 ce=1.9619 lr=9.82e-06
+Step    375 | loss=2.3508 ce=2.3508 lr=9.78e-06
+Step    400 | loss=1.8638 ce=1.8638 lr=9.74e-06
+Step    425 | loss=1.8628 ce=1.8628 lr=9.69e-06
+Step    450 | loss=2.2551 ce=2.2551 lr=9.64e-06
+Step    475 | loss=3.3584 ce=3.3584 lr=9.59e-06
+Step    500 | loss=2.5450 ce=2.5450 lr=9.54e-06
+Running validation at step 500...
+Step    500 [VAL] | loss=2.0325 ce=2.0325
+Step    525 | loss=1.3461 ce=1.3461 lr=9.48e-06
+Step    550 | loss=1.6982 ce=1.6982 lr=9.42e-06
+Step    575 | loss=2.9260 ce=2.9260 lr=9.35e-06
+Step    600 | loss=2.7950 ce=2.7950 lr=9.28e-06
+Step    625 | loss=2.0022 ce=2.0022 lr=9.21e-06
+Step    650 | loss=1.8680 ce=1.8680 lr=9.14e-06
+Step    675 | loss=1.9202 ce=1.9202 lr=9.06e-06
+Step    700 | loss=2.6181 ce=2.6181 lr=8.98e-06
+Step    725 | loss=1.3247 ce=1.3247 lr=8.90e-06
+Step    750 | loss=1.6717 ce=1.6717 lr=8.81e-06
+Running validation at step 750...
+Step    750 [VAL] | loss=2.0291 ce=2.0291
+Step    775 | loss=2.0479 ce=2.0479 lr=8.72e-06
+Step    800 | loss=1.7153 ce=1.7153 lr=8.63e-06
+Step    825 | loss=0.8697 ce=0.8697 lr=8.54e-06
+Step    850 | loss=1.5706 ce=1.5706 lr=8.44e-06
+Step    875 | loss=1.0395 ce=1.0395 lr=8.34e-06
+Step    900 | loss=1.0374 ce=1.0374 lr=8.24e-06
+Step    925 | loss=2.7147 ce=2.7147 lr=8.13e-06
+Step    950 | loss=1.7063 ce=1.7063 lr=8.03e-06
+Step    975 | loss=2.7216 ce=2.7216 lr=7.92e-06
+Step   1000 | loss=1.5919 ce=1.5919 lr=7.81e-06
+Running validation at step 1000...
+Step   1000 [VAL] | loss=2.0253 ce=2.0253
+Step   1025 | loss=2.6228 ce=2.6228 lr=7.69e-06
+Step   1050 | loss=2.7852 ce=2.7852 lr=7.58e-06
+Step   1075 | loss=1.3061 ce=1.3061 lr=7.46e-06
+Step   1100 | loss=1.8275 ce=1.8275 lr=7.34e-06
+Step   1125 | loss=2.1128 ce=2.1128 lr=7.22e-06
+Step   1150 | loss=2.8605 ce=2.8605 lr=7.10e-06
+Step   1175 | loss=2.5217 ce=2.5217 lr=6.98e-06
+Step   1200 | loss=2.1765 ce=2.1765 lr=6.85e-06
+Step   1225 | loss=1.5701 ce=1.5701 lr=6.72e-06
+Step   1250 | loss=2.7289 ce=2.7289 lr=6.60e-06
+Running validation at step 1250...
+Step   1250 [VAL] | loss=2.0251 ce=2.0251
+Step   1275 | loss=2.6356 ce=2.6356 lr=6.47e-06
+Step   1300 | loss=2.4268 ce=2.4268 lr=6.34e-06
+Step   1325 | loss=2.4604 ce=2.4604 lr=6.21e-06
+Step   1350 | loss=1.7054 ce=1.7054 lr=6.07e-06
+Step   1375 | loss=1.8398 ce=1.8398 lr=5.94e-06
+Step   1400 | loss=1.9321 ce=1.9321 lr=5.81e-06
+Step   1425 | loss=1.3033 ce=1.3033 lr=5.68e-06
+Step   1450 | loss=1.7609 ce=1.7609 lr=5.54e-06
+Step   1475 | loss=2.3422 ce=2.3422 lr=5.41e-06
+Step   1500 | loss=1.3846 ce=1.3846 lr=5.27e-06
+Running validation at step 1500...
+Step   1500 [VAL] | loss=2.0243 ce=2.0243
+Writing model shards:   0%|          | 0/1 [00:00<?, ?it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.28it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.28it/s]
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'open-web-math/open-web-math' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Saved checkpoint to /workspace/run/cpt/step_1500
+Metrics saved to /workspace/run/cpt/metrics.pkl
+Step   1525 | loss=1.9284 ce=1.9284 lr=5.14e-06
+Step   1550 | loss=1.6035 ce=1.6035 lr=5.00e-06
+Step   1575 | loss=3.6152 ce=3.6152 lr=4.86e-06
+Step   1600 | loss=2.5027 ce=2.5027 lr=4.73e-06
+Step   1625 | loss=2.6427 ce=2.6427 lr=4.59e-06
+Step   1650 | loss=2.4733 ce=2.4733 lr=4.46e-06
+Step   1675 | loss=2.3102 ce=2.3102 lr=4.32e-06
+Step   1700 | loss=1.3397 ce=1.3397 lr=4.19e-06
+Step   1725 | loss=2.2198 ce=2.2198 lr=4.06e-06
+Step   1750 | loss=2.7799 ce=2.7799 lr=3.93e-06
+Running validation at step 1750...
+Step   1750 [VAL] | loss=2.0238 ce=2.0238
+Step   1775 | loss=2.7499 ce=2.7499 lr=3.79e-06
+Step   1800 | loss=2.7273 ce=2.7273 lr=3.66e-06
+Step   1825 | loss=1.5235 ce=1.5235 lr=3.53e-06
+Step   1850 | loss=1.8132 ce=1.8132 lr=3.40e-06
+Step   1875 | loss=3.3174 ce=3.3174 lr=3.28e-06
+Step   1900 | loss=1.9425 ce=1.9425 lr=3.15e-06
+Step   1925 | loss=1.9527 ce=1.9527 lr=3.02e-06
+Step   1950 | loss=1.7047 ce=1.7047 lr=2.90e-06
+Step   1975 | loss=3.0519 ce=3.0519 lr=2.78e-06
+Step   2000 | loss=2.1084 ce=2.1084 lr=2.66e-06
+Running validation at step 2000...
+Step   2000 [VAL] | loss=2.0233 ce=2.0233
+Step   2025 | loss=1.3167 ce=1.3167 lr=2.54e-06
+Step   2050 | loss=2.0463 ce=2.0463 lr=2.42e-06
+Step   2075 | loss=1.9603 ce=1.9603 lr=2.31e-06
+Step   2100 | loss=3.4044 ce=3.4044 lr=2.19e-06
+Step   2125 | loss=1.5287 ce=1.5287 lr=2.08e-06
+Step   2150 | loss=2.1091 ce=2.1091 lr=1.97e-06
+Step   2175 | loss=1.3397 ce=1.3397 lr=1.87e-06
+Step   2200 | loss=2.6657 ce=2.6657 lr=1.76e-06
+Step   2225 | loss=1.3474 ce=1.3474 lr=1.66e-06
+Step   2250 | loss=3.7123 ce=3.7123 lr=1.56e-06
+Running validation at step 2250...
+Step   2250 [VAL] | loss=2.0229 ce=2.0229
+Step   2275 | loss=3.3921 ce=3.3921 lr=1.46e-06
+Step   2300 | loss=1.4298 ce=1.4298 lr=1.37e-06
+Step   2325 | loss=2.2532 ce=2.2532 lr=1.28e-06
+Step   2350 | loss=1.9777 ce=1.9777 lr=1.19e-06
+Step   2375 | loss=2.1051 ce=2.1051 lr=1.10e-06
+Step   2400 | loss=1.7398 ce=1.7398 lr=1.02e-06
+Step   2425 | loss=2.4765 ce=2.4765 lr=9.39e-07
+Step   2450 | loss=2.8643 ce=2.8643 lr=8.62e-07
+Step   2475 | loss=2.1861 ce=2.1861 lr=7.87e-07
+Step   2500 | loss=2.3264 ce=2.3264 lr=7.16e-07
+Running validation at step 2500...
+Step   2500 [VAL] | loss=2.0230 ce=2.0230
+Step   2525 | loss=2.2091 ce=2.2091 lr=6.47e-07
+Step   2550 | loss=3.1341 ce=3.1341 lr=5.82e-07
+Step   2575 | loss=1.5572 ce=1.5572 lr=5.21e-07
+Step   2600 | loss=1.6876 ce=1.6876 lr=4.62e-07
+Step   2625 | loss=2.0126 ce=2.0126 lr=4.07e-07
+Step   2650 | loss=0.6644 ce=0.6644 lr=3.55e-07
+Step   2675 | loss=1.8531 ce=1.8531 lr=3.07e-07
+Step   2700 | loss=1.8746 ce=1.8746 lr=2.62e-07
+Step   2725 | loss=3.3218 ce=3.3218 lr=2.20e-07
+Step   2750 | loss=0.1338 ce=0.1338 lr=1.82e-07
+Running validation at step 2750...
+Step   2750 [VAL] | loss=2.0230 ce=2.0230
+Step   2775 | loss=2.3715 ce=2.3715 lr=1.48e-07
+Step   2800 | loss=1.9843 ce=1.9843 lr=1.17e-07
+Step   2825 | loss=1.4295 ce=1.4295 lr=8.96e-08
+Step   2850 | loss=2.1095 ce=2.1095 lr=6.59e-08
+Step   2875 | loss=2.3317 ce=2.3317 lr=4.58e-08
+Step   2900 | loss=2.4289 ce=2.4289 lr=2.93e-08
+Step   2925 | loss=2.7756 ce=2.7756 lr=1.65e-08
+Step   2950 | loss=1.5122 ce=1.5122 lr=7.33e-09
+Step   2975 | loss=0.3557 ce=0.3557 lr=1.83e-09
+Step   3000 | loss=3.4424 ce=3.4424 lr=0.00e+00
+Running validation at step 3000...
+Step   3000 [VAL] | loss=2.0229 ce=2.0229
+Writing model shards:   0%|          | 0/1 [00:00<?, ?it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.56it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.56it/s]
+Saved checkpoint to /workspace/run/cpt/step_3000
+Metrics saved to /workspace/run/cpt/metrics.pkl
+Writing model shards:   0%|          | 0/1 [00:00<?, ?it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.24it/s]Writing model shards: 100%|██████████| 1/1 [00:00<00:00,  1.24it/s]
+Training complete. Final model saved to /workspace/run/cpt/final
+Metrics history saved to /workspace/run/cpt/metrics.pkl

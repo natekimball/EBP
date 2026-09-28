@@ -643,6 +643,8 @@ class TestPretrainingDatasetSeparator(unittest.TestCase):
             {"text": "b " * 20},
         ]
 
+        # PretrainingDataset is an IterableDataset: the stream is consumed in
+        # __iter__, so the patch has to stay active while we iterate.
         with patch("ebp.data.load_dataset", return_value=mock_dataset):
             dataset = PretrainingDataset(
                 tokenizer=tokenizer,
@@ -652,11 +654,13 @@ class TestPretrainingDatasetSeparator(unittest.TestCase):
                 stride=15,
                 min_doc_chars=1,
             )
+            examples = list(dataset)
 
-        # Flatten all stored tokens and check EOS is present between docs
+        # Flatten all yielded tokens and check EOS is present between docs
         all_stored = []
-        for ex in dataset.examples:
-            all_stored.extend(ex)
+        for ex in examples:
+            all_stored.extend(ex["context_ids"])
+            all_stored.extend(ex["completion_ids"])
 
         self.assertIn(EOS_ID, all_stored, "EOS separator not found between documents")
 

@@ -19,8 +19,9 @@ For each training example *(context c, reference completion y)*:
 1. **Generate rollouts** – sample *n* completions `ŷ_j ~ p_θ(·|c)`.
 2. **Extract features** – run the feature network (EMA or Online weights) to obtain `ϕ(c:y)` and
    `ϕ(c:ŷ_j)` at layers placed at depths 25 %, 50 %, and 75 % of the network.
-   Each per-layer vector is mean-pooled over the completion positions and
-   L2-normalised.
+   Each per-layer vector is pooled over the completion positions and
+   L2-normalised (`--pool_type`, default `last`; `mean` averages over the
+   completion instead).
 3. **Compute rewards** (EBFT Eq. 7):
 
    ```
@@ -29,10 +30,30 @@ For each training example *(context c, reference completion y)*:
    ```
 
 4. **REINFORCE with RLOO baseline** – update `p_θ` to maximise
-   `E[r_j · log p_θ(ŷ_j|c)]`.
+   `E[r_j · log p_θ(ŷ_j|c)]`.  Advantages are *not* divided by the per-group
+   standard deviation: the leave-one-out baseline is already unbiased, and
+   dividing by a std estimated from the same `n` samples would rescale every
+   context to unit gradient magnitude — promoting contexts whose rollouts
+   barely differed to full weight.  Use `--min_reward_std` to drop those
+   contexts instead.
 5. **Cross-entropy term** (optional, weight `γ`) – standard teacher-forcing
    loss for stable training.
 6. **Update EMA** – `ema ← τ·ema + (1-τ)·θ` (stop-gradient).
+
+7. **SIGReg (optional, weight `--sigreg_weight`)** – anti-collapse regulariser
+   from [LeJEPA](https://arxiv.org/abs/2511.08544). Projects the per-layer
+   features onto random 1-D directions and pushes each projection toward a
+   standard normal via the Epps-Pulley statistic. Because EBP features are
+   L2-normalised, the target is *uniformity on the sphere* — what an isotropic
+   Gaussian becomes after normalisation — enforced by testing `√d · φ̂`. This
+   makes the penalty independent of the language model's activation scale.
+
+   Two notes on why it is applied the way it is. It uses **per-position**
+   features (`--sigreg_positions`) rather than the pooled per-sequence vectors:
+   pooling gives only `batch_size` samples per step, far too few to estimate a
+   distributional statistic. And it catches **dimensional** collapse — features
+   spanning a low-rank subspace — which the mean pairwise cosine similarity
+   (logged as `feature_cos`) cannot see.
 
 For a direct continued-pretraining baseline, pass `--ce_only` to disable the
 feature-matching / REINFORCE objective and optimize only the standard
@@ -142,7 +163,9 @@ python benchmark.py --model_type online --gamma 0.1 --batch_size 4
 | `--model_name` | `Qwen/Qwen3-0.6B` | HuggingFace model identifier. |
 | `--model_type` | `ema` | `ema` (dual network) or `online` (single network). |
 | `--memory_constrained` | `false` | Split backward pass to cut peak VRAM ~30%; disables CUDA graphs. Use only if OOM. |
-| `--gamma` | `0.1` | Weight of the Cross-Entropy loss term. |
+| `--gamma` | `0.1` | Weight of the Cross-Entropy term **relative to** REINFORCE. AdamW is invariant to overall loss scale, so this ratio alone sets the balance. The REINFORCE gradient measures ~25–33× a `gamma=0.1` CE gradient on Qwen3-0.6B, so `gamma` well above 1.0 is needed for CE to dominate. |
+| `--min_reward_std` | `0.0` | Drop contexts whose reward spread across rollouts falls at or below this value — the continuous analogue of DAPO's dynamic sampling. `0.0` disables filtering. |
+| `--loss_agg` | `token` | REINFORCE loss aggregation. `token` normalises by total completion tokens in the batch (length-unbiased); `sequence` averages over rollouts (length-biased). |
 | `--num_rollouts` | `4` | Number of completions sampled per context. |
 | `--generation_length` | `8` | Tokens generated per rollout. |
 | `--ema_decay` | `0.999` | EMA decay factor $\tau$ (only used with `--model_type ema`). |
@@ -152,6 +175,11 @@ python benchmark.py --model_type online --gamma 0.1 --batch_size 4
 | `--compile_model` | `false` | Compile generator with `torch.compile`. |
 | `--compile_mode` | `default` | `torch.compile` mode (`default` or `reduce-overhead`). |
 | `--whitening` | `true` | Use whitened feature matching (EBFT Eq. 9). |
+| `--sigreg_weight` | `0.0` | Weight of the SIGReg anti-collapse penalty (LeJEPA). `0.0` disables it. |
+| `--sigreg_mode` | `full` | `full` = Epps-Pulley on random 1-D slices (all moments); `weak` = `\|\|Cov − I\|\|_F` on a sketch (2nd moment, needs `N > sketch_dim`). |
+| `--sigreg_positions` | `64` | Sequence positions sampled per example. Pooled features give only `batch_size` samples — too few for a distributional statistic. |
+| `--sigreg_slices` | `8` | Random 1-D projections (`full` mode). |
+| `--sigreg_sketch_dim` | `64` | Sketch width (`weak` mode). |
 | `--use_fused_adamw` | `true` | Use fused CUDA AdamW kernels when available. |
 | `--warmup_steps` | `0` | Linear LR warmup steps before cosine decay. |
 | `--grad_accum_steps` | `1` | Gradient accumulation steps (effective batch = `batch_size × N`). |
