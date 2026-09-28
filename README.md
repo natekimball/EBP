@@ -1,5 +1,11 @@
 # EBP – Energy-Based Pre-Training
 
+> **Picking this up on a new machine?** Start with [HANDOFF.md](HANDOFF.md).
+> It has the current experimental state, what is and isn't preserved, and the open
+> decisions. Prior session memories were copied to `results/memory/` because they
+> otherwise live only in `~/.claude/` on a machine that has been decommissioned.
+> Measured results and diagnostics are in `results/`.
+
 Pre-trains a causal language model (default: **Qwen/Qwen3-0.6B**) with a
 feature-matching objective inspired by
 [Energy-Based Fine-Tuning (EBFT)](https://arxiv.org/abs/2503.xxxxx).
