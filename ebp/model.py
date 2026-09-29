@@ -79,9 +79,20 @@ def _pool_hidden_state(
         else:
             pooled = h.mean(dim=1)
     else:
-        # last-token pooling
+        # Last-token pooling: index the final *unmasked* position.  The mask is
+        # not necessarily right-aligned — ``collate_fn`` left-pads contexts and
+        # right-pads completions, so ``attention_mask.sum(dim=1) - 1`` would
+        # land in the middle of the sequence.  Scan from the right instead.
         if attention_mask is not None:
-            last_indices = attention_mask.sum(dim=1).long() - 1
+            mask = attention_mask
+            if completion_start is not None:
+                mask = mask[:, completion_start:]
+            seq_len = mask.shape[1]
+            # Index of the last 1 in each row (0 if the row is entirely masked).
+            rev_first_one = torch.argmax(mask.flip(dims=(1,)).long(), dim=1)
+            last_indices = (seq_len - 1 - rev_first_one).clamp(min=0)
+            if completion_start is not None:
+                last_indices = last_indices + completion_start
             batch_range = torch.arange(h.size(0), device=h.device)
             pooled = h[batch_range, last_indices]
         else:
@@ -111,10 +122,11 @@ def _sum_completion_log_probs(
     shift_logits = logits[:, :-1, :]  # (B, L-1, V)
     shift_labels = input_ids[:, 1:]   # (B, L-1)
 
-    log_probs_all = F.log_softmax(shift_logits, dim=-1)
-    token_log_probs = log_probs_all.gather(
-        dim=-1, index=shift_labels.unsqueeze(-1)
-    ).squeeze(-1)  # (B, L-1)
+    # log p(label) = logit[label] - logsumexp(logits).
+    # Both ops reduce over V without materializing a (B, L, V) intermediate.
+    label_logits = shift_logits.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
+    log_sum_exp = torch.logsumexp(shift_logits, dim=-1)
+    token_log_probs = label_logits - log_sum_exp
 
     if completion_start is not None:
         # token_log_probs[t] is the log-prob of input_ids[t+1]; to get the
@@ -177,6 +189,51 @@ def _features_from_hidden_states(
     return torch.cat(blocks, dim=-1)
 
 
+def _position_features_from_hidden_states(
+    hidden_states: Tuple[torch.Tensor, ...],
+    feature_layer_indices: Sequence[int],
+    attention_mask: Optional[torch.Tensor],
+    max_positions: int,
+) -> torch.Tensor:
+    """Per-position L2-normalised features, **not** detached, for SIGReg.
+
+    The reward pools each sequence down to a single vector, which gives only
+    ``B`` samples per batch — far too few to estimate a distributional statistic
+    and rank-deficient in the same way that makes the rollout covariance
+    unusable.  Regularising the per-token representations instead yields
+    ``B * max_positions`` samples from the same layers at no extra forward cost,
+    and shapes the representation the pooling reads from.
+
+    Positions are subsampled uniformly and masked positions dropped.
+
+    Args:
+        hidden_states: Tuple of ``(B, L, D)`` hidden states from the model.
+        feature_layer_indices: Transformer block indices to read.
+        attention_mask: ``(B, L)`` binary mask; padded positions are excluded.
+        max_positions: Positions to sample per sequence.
+
+    Returns:
+        ``(N, D * K)`` features carrying gradient, where ``N <= B * max_positions``.
+    """
+    ref = hidden_states[feature_layer_indices[0] + 1]
+    b, seq_len, _ = ref.shape
+    num_pos = min(max_positions, seq_len)
+
+    idx = torch.randperm(seq_len, device=ref.device)[:num_pos]  # (P,)
+
+    blocks = []
+    for layer_idx in feature_layer_indices:
+        h = hidden_states[layer_idx + 1][:, idx, :]  # (B, P, D)
+        blocks.append(F.normalize(h, p=2, dim=-1))
+    feats = torch.cat(blocks, dim=-1).reshape(b * num_pos, -1)
+
+    if attention_mask is not None:
+        valid = attention_mask[:, idx].reshape(-1).bool()
+        if not bool(valid.all()):
+            feats = feats[valid]
+    return feats
+
+
 # ---------------------------------------------------------------------------
 # BaseEBPModel
 # ---------------------------------------------------------------------------
@@ -201,7 +258,7 @@ class BaseEBPModel(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-0.6B",
+        model_name: str = "Qwen/Qwen3-0.6B-Base",
         feature_layer_fractions: Sequence[float] = (0.25, 0.50, 0.75),
         pool_type: str = "last",
         model: Optional[nn.Module] = None,
@@ -273,7 +330,7 @@ class BaseEBPModel(nn.Module):
             max_new_tokens=generation_length,
             do_sample=True,
             temperature=temperature,
-            pad_token_id=self.model.config.eos_token_id,
+            pad_token_id=(self._eos_token_ids() or [None])[0],
             **generate_kwargs,
         )
 
@@ -291,12 +348,31 @@ class BaseEBPModel(nn.Module):
         else:
             output_ids = self.model.generate(**generate_kwargs_common, use_cache=False)
 
-        gen_len = output_ids.shape[1] - context_len
-        new_mask = torch.ones(
-            output_ids.shape[0], gen_len, dtype=torch.long, device=output_ids.device
-        )
+        # Mask out everything *after* a generated EOS.  ``generate`` right-pads
+        # finished sequences with ``pad_token_id``; without this those filler
+        # tokens would contribute to the pooled features and would receive
+        # REINFORCE credit in the summed log-probability.
+        generated = output_ids[:, context_len:]
+        new_mask = torch.ones_like(generated, dtype=torch.long)
+        eos_ids = self._eos_token_ids()
+        if eos_ids:
+            is_eos = torch.zeros_like(generated, dtype=torch.bool)
+            for eos_id in eos_ids:
+                is_eos |= generated == eos_id
+            # cumsum - self keeps the first EOS unmasked and drops the rest.
+            new_mask = ((is_eos.long().cumsum(dim=1) - is_eos.long()) == 0).long()
+
         rollout_masks = torch.cat([expanded_mask, new_mask], dim=1)
         return output_ids, rollout_masks
+
+    def _eos_token_ids(self) -> List[int]:
+        """Return the model's EOS token id(s) as a flat list (may be empty)."""
+        eos = getattr(self.model.config, "eos_token_id", None)
+        if eos is None:
+            return []
+        if isinstance(eos, int):
+            return [eos]
+        return [int(e) for e in eos]
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +404,7 @@ class EMAEBPModel(BaseEBPModel):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-0.6B",
+        model_name: str = "Qwen/Qwen3-0.6B-Base",
         ema_decay: float = 0.999,
         feature_layer_fractions: Sequence[float] = (0.25, 0.50, 0.75),
         pool_type: str = "last",
@@ -421,8 +497,13 @@ class EMAEBPModel(BaseEBPModel):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         completion_start: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sigreg_positions: int = 0,
+    ) -> Tuple[torch.Tensor, ...]:
         """Return CE loss and detached reference features.
+
+        When ``sigreg_positions > 0`` a third value is returned: per-position
+        features from the *trainable* generator that still carry gradient, for
+        the SIGReg penalty.  Reference features still come from the EMA model.
 
         CE is computed on the trainable generator; reference features come
         from the EMA model.
@@ -436,18 +517,28 @@ class EMAEBPModel(BaseEBPModel):
             ce_loss: Scalar CE loss tensor with gradients.
             ref_features: ``(B, D * K)`` detached EMA reference features.
         """
-        ce_loss = self.model(
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=input_ids,
             use_cache=False,
-        ).loss
+            output_hidden_states=sigreg_positions > 0,
+            return_dict=True,
+        )
         ref_features = self.extract_features(
             input_ids=input_ids,
             attention_mask=attention_mask,
             completion_start=completion_start,
         )
-        return ce_loss, ref_features
+        if sigreg_positions > 0:
+            policy_features = _position_features_from_hidden_states(
+                hidden_states=outputs.hidden_states,
+                feature_layer_indices=self.feature_layer_indices,
+                attention_mask=attention_mask,
+                max_positions=sigreg_positions,
+            )
+            return outputs.loss, ref_features, policy_features
+        return outputs.loss, ref_features
 
     # ------------------------------------------------------------------
     # Combined rollout data (features from EMA + log probs from generator)
@@ -536,7 +627,7 @@ class OnlineEBPModel(BaseEBPModel):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-0.6B",
+        model_name: str = "Qwen/Qwen3-0.6B-Base",
         feature_layer_fractions: Sequence[float] = (0.25, 0.50, 0.75),
         pool_type: str = "last",
         model: Optional[nn.Module] = None,
@@ -641,8 +732,12 @@ class OnlineEBPModel(BaseEBPModel):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         completion_start: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sigreg_positions: int = 0,
+    ) -> Tuple[torch.Tensor, ...]:
         """Single forward pass returning CE loss and detached reference features.
+
+        When ``sigreg_positions > 0`` a third value is returned: per-position
+        features that still carry gradient, for the SIGReg penalty.
 
         Args:
             input_ids: ``(B, L)`` full sequence (context + completion).
@@ -653,7 +748,8 @@ class OnlineEBPModel(BaseEBPModel):
             ce_loss: Scalar CE loss tensor with gradients.
             ref_features: ``(B, D * K)`` detached reference features.
         """
-        outputs = self.model(
+        raw_model = getattr(self.model, "_orig_mod", self.model)
+        outputs = raw_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=input_ids,
@@ -669,6 +765,14 @@ class OnlineEBPModel(BaseEBPModel):
             detach=True,
             pool_type=self.pool_type,
         )
+        if sigreg_positions > 0:
+            policy_features = _position_features_from_hidden_states(
+                hidden_states=outputs.hidden_states,
+                feature_layer_indices=self.feature_layer_indices,
+                attention_mask=attention_mask,
+                max_positions=sigreg_positions,
+            )
+            return outputs.loss, ref_features, policy_features
         return outputs.loss, ref_features
 
     # ------------------------------------------------------------------
@@ -681,18 +785,136 @@ class OnlineEBPModel(BaseEBPModel):
         rollout_ids: torch.Tensor,
         rollout_masks: torch.Tensor,
         completion_start: int,
+        chunk_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return features and log-probs for all rollouts in a single pass.
+        """Return features and log-probs for all rollouts.
+
+        When ``chunk_size`` is set, processes sequences in chunks under
+        ``torch.no_grad()`` using the uncompiled model to avoid OOM on large
+        rollout batches (e.g. during validation).
 
         Args:
             rollout_ids: ``(B * n, context_len + gen_len)`` rollout token ids.
             rollout_masks: ``(B * n, context_len + gen_len)`` attention masks.
             completion_start: Index of the first generated token.
+            chunk_size: Sequences per forward pass. ``None`` = all at once.
 
         Returns:
             features: ``(B * n, feat_dim)`` - detached feature vectors.
-            log_probs: ``(B * n,)`` - differentiable summed log-probabilities.
+            log_probs: ``(B * n,)`` - summed log-probabilities.
         """
-        return self.extract_features_and_log_probs(
-            rollout_ids, rollout_masks, completion_start
+        if chunk_size is None:
+            return self.extract_features_and_log_probs(
+                rollout_ids, rollout_masks, completion_start
+            )
+        raw_model = getattr(self.model, "_orig_mod", self.model)
+        N = rollout_ids.shape[0]
+        all_features: list[torch.Tensor] = []
+        all_log_probs: list[torch.Tensor] = []
+        with torch.no_grad():
+            for start in range(0, N, chunk_size):
+                chunk_ids = rollout_ids[start : start + chunk_size]
+                chunk_masks = rollout_masks[start : start + chunk_size]
+                outputs = raw_model(
+                    input_ids=chunk_ids,
+                    attention_mask=chunk_masks,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                features = _features_from_hidden_states(
+                    hidden_states=outputs.hidden_states,
+                    feature_layer_indices=self.feature_layer_indices,
+                    attention_mask=chunk_masks,
+                    completion_start=completion_start,
+                    detach=True,
+                    pool_type=self.pool_type,
+                )
+                log_probs = _sum_completion_log_probs(
+                    outputs.logits, chunk_ids, chunk_masks, completion_start
+                )
+                all_features.append(features)
+                all_log_probs.append(log_probs)
+        return torch.cat(all_features, dim=0), torch.cat(all_log_probs, dim=0)
+
+    @torch.compiler.disable
+    def compute_rollout_features(
+        self,
+        rollout_ids: torch.Tensor,
+        rollout_masks: torch.Tensor,
+        completion_start: int,
+        chunk_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Compute detached rollout features in chunks to avoid OOM.
+
+        Runs under ``torch.no_grad()``; logits are freed after each chunk.
+
+        Args:
+            rollout_ids: ``(N, L)`` rollout token ids.
+            rollout_masks: ``(N, L)`` attention masks.
+            completion_start: Index of the first completion token.
+            chunk_size: Sequences per forward pass. ``None`` = all at once.
+
+        Returns:
+            ``(N, feat_dim)`` detached feature vectors.
+        """
+        # Use the uncompiled model to avoid triggering Inductor kernel generation
+        # for the chunked (batch_size=chunk, full_seq_len) shapes, which are different
+        # from the compiled paths (generation: batch*K×1, CE: batch×seq).
+        raw_model = getattr(self.model, "_orig_mod", self.model)
+        N = rollout_ids.shape[0]
+        step = chunk_size if chunk_size is not None else N
+        all_features: list[torch.Tensor] = []
+        with torch.no_grad():
+            for start in range(0, N, step):
+                chunk_ids = rollout_ids[start : start + step]
+                chunk_masks = rollout_masks[start : start + step]
+                outputs = raw_model(
+                    input_ids=chunk_ids,
+                    attention_mask=chunk_masks,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                feat = _features_from_hidden_states(
+                    hidden_states=outputs.hidden_states,
+                    feature_layer_indices=self.feature_layer_indices,
+                    attention_mask=chunk_masks,
+                    completion_start=completion_start,
+                    detach=True,
+                    pool_type=self.pool_type,
+                )
+                all_features.append(feat)
+                # outputs (logits + hidden_states) freed here
+        return torch.cat(all_features, dim=0)
+
+    def compute_log_probs_chunk(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        completion_start: int,
+    ) -> torch.Tensor:
+        """Forward pass returning only differentiable log-probs (no hidden states).
+
+        Uses the compiled model directly — no hidden states needed, so the
+        output_capturing hooks are not required and fullgraph=True is compatible.
+        Dynamo compiles a cached trace for the chunk shape on first call.
+
+        Args:
+            input_ids: ``(B, L)`` token ids.
+            attention_mask: ``(B, L)`` mask.
+            completion_start: Index of the first completion token.
+
+        Returns:
+            ``(B,)`` summed log-probs with gradient.
+        """
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        return _sum_completion_log_probs(
+            outputs.logits, input_ids, attention_mask, completion_start
         )

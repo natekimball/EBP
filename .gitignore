@@ -2,10 +2,31 @@ __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
-output/
 *.egg-info/
 dist/
 build/
 *.egg
 ENV/
 wandb/
+.venv/
+
+# scratch / working dirs
+.runpod/
+.vscode/
+
+# training outputs: model weights + optimizer state, tens of GB, re-derivable
+output/
+output_large/
+cpt_output/
+test_output/
+runpod_results/
+
+# large local datasets (398GB tokenized corpus + subsets)
+data/
+ds_tok/
+
+# stray root-level logs (the tracked copies live in results/logs/)
+/train_log.txt
+/output_large_train.log
+/tea_debug.log
+/tmp

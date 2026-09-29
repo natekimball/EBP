@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi)",
+      "Bash(nvidia-smi *)",
+      "Bash(tmux ls)",
+      "Bash(tmux ls *)",
+      "Bash(tmux has-session *)",
+      "Bash(tmux capture-pane *)",
+      "Bash(journalctl *)",
+      "Bash(systemctl status *)",
+      "Bash(tailscale status)",
+      "Bash(tailscale status *)",
+      "Bash(loginctl show-user *)",
+      "Bash(apt-cache policy *)",
+      "mcp__plugin_runpod_runpod__get-pod",
+      "mcp__plugin_runpod_runpod__list-pods",
+      "mcp__plugin_runpod_runpod__list-gpu-types",
+      "mcp__plugin_runpod_runpod__get-gpu-type",
+      "mcp__plugin_runpod_runpod__get-capacity",
+      "mcp__plugin_runpod_runpod__list-billing",
+      "mcp__plugin_runpod_runpod__list-pod-billing",
+      "mcp__plugin_runpod_runpod__read_journal",
+      "mcp__plugin_runpod_runpod__list-public-templates"
+    ]
+  }
+}
